@@ -827,7 +827,7 @@ public class BluetoothOppService extends Service {
         info.mDestination = stringFromCursor(info.mDestination, cursor, BluetoothShare.DESTINATION);
         int newVisibility = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.VISIBILITY));
 
-        boolean confirmed = false;
+        boolean confirmUpdated = false;
         int newConfirm = cursor.getInt(cursor
                 .getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION));
 
@@ -841,7 +841,7 @@ public class BluetoothOppService extends Service {
 
         if (info.mConfirm == BluetoothShare.USER_CONFIRMATION_PENDING
                 && newConfirm != BluetoothShare.USER_CONFIRMATION_PENDING) {
-            confirmed = true;
+            confirmUpdated = true;
         }
         info.mConfirm = newConfirm;
         int newStatus = cursor.getInt(statusColumn);
@@ -858,14 +858,14 @@ public class BluetoothOppService extends Service {
         info.mTimestamp = cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.TIMESTAMP));
         info.mMediaScanned = (cursor.getInt(cursor.getColumnIndexOrThrow(Constants.MEDIA_SCANNED)) != Constants.MEDIA_SCANNED_NOT_SCANNED);
 
-        if (confirmed) {
-            if (V) Log.v(TAG, "Service handle info " + info.mId + " confirmed");
-            /* Inbounds transfer get user confirmation, so we start it */
+        if (confirmUpdated) {
+            if (V) Log.v(TAG, "Service handle info " + info.mId + " confirmation updated");
+            /* Inbounds transfer user confirmation status changed, update the session server */
             int i = findBatchWithTimeStamp(info.mTimestamp);
             if (i != -1) {
                 BluetoothOppBatch batch = mBatchs.get(i);
                 if (mServerTransfer != null && batch.mId == mServerTransfer.getBatchId()) {
-                    mServerTransfer.setConfirmed();
+                    mServerTransfer.confirmStatusChanged();
                 } //TODO need to think about else
             }
         }
@@ -1010,7 +1010,7 @@ public class BluetoothOppService extends Service {
                         BluetoothOppShareInfo mPendingShare = nextBatch.getPendingShare();
                         if ((mPendingShare != null) && (mPendingShare.mConfirm ==
                                 BluetoothShare.USER_CONFIRMATION_CONFIRMED)) {
-                            mServerTransfer.setConfirmed();
+                            mServerTransfer.confirmStatusChanged();
                         }
                         return;
                     }
