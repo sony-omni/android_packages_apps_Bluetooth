@@ -23,8 +23,10 @@
     <bool name="profile_supported_pan">true</bool>
     <bool name="profile_supported_pbap">true</bool>
     <bool name="profile_supported_gatt">true</bool>
+    <bool name="profile_supported_hidd">true</bool>
     <bool name="pbap_include_photos_in_vcard">false</bool>
     <bool name="pbap_use_profile_for_owner_vcard">true</bool>
     <bool name="profile_supported_map">true</bool>
     <bool name="profile_supported_avrcp_controller">false</bool>
+    <bool name="config_airplane_invalid">false</bool>
 </resources>

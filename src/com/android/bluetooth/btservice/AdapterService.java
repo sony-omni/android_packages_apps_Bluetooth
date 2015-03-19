@@ -1,5 +1,8 @@
 /*
+ * Copyright (C) 2013 The Linux Foundation. All rights reserved
+ * Not a Contribution.
  * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2013-14 The Linux Foundation. All rights reserved
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +29,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothRemoteDiRecord;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothUuid;
 import android.bluetooth.IBluetooth;
@@ -51,13 +55,17 @@ import android.os.Process;
 import android.os.RemoteCallbackList;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.provider.Settings;
 import android.util.Log;
 import android.util.Pair;
 import com.android.bluetooth.a2dp.A2dpService;
+import com.android.bluetooth.a2dp.A2dpSinkService;
 import com.android.bluetooth.hid.HidService;
+import com.android.bluetooth.hid.HidDevService;
 import com.android.bluetooth.hfp.HeadsetService;
 import com.android.bluetooth.hdp.HealthService;
+import com.android.bluetooth.hfpclient.HeadsetClientService;
 import com.android.bluetooth.pan.PanService;
 import com.android.bluetooth.R;
 import com.android.bluetooth.Utils;
@@ -66,6 +74,7 @@ import java.io.FileDescriptor;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.Map;
 import java.util.Iterator;
@@ -80,7 +89,8 @@ public class AdapterService extends Service {
     private static final boolean TRACE_REF = true;
     private static final int MIN_ADVT_INSTANCES_FOR_MA = 5;
     private static final int MIN_OFFLOADED_FILTERS = 10;
-    private static final int MIN_OFFLOADED_SCAN_STORAGE_BYTES = 1024;
+    private static final int MIN_OFFLOADED_SCAN_STORAGE_BYTES = 2048;
+    private static final String delayConnectTimeoutDevice[] = {"00:23:3D"}; // volkswagen carkit
     //For Debugging only
     private static int sRefCount=0;
 
@@ -101,6 +111,10 @@ public class AdapterService extends Service {
     private static final String ACTION_ALARM_WAKEUP =
         "com.android.bluetooth.btservice.action.ALARM_WAKEUP";
 
+    static final ParcelUuid[] A2DP_SOURCE_SINK_UUIDS = {
+        BluetoothUuid.AudioSource,
+        BluetoothUuid.AudioSink
+    };
     static final String BLUETOOTH_ADMIN_PERM =
         android.Manifest.permission.BLUETOOTH_ADMIN;
     public static final String BLUETOOTH_PRIVILEGED =
@@ -116,9 +130,9 @@ public class AdapterService extends Service {
     private static final int ADAPTER_SERVICE_TYPE=Service.START_STICKY;
 
     static {
+        System.load("/system/lib/libbluetooth_jni.so");
         classInitNative();
     }
-
     private static AdapterService sAdapterService;
     public static synchronized AdapterService getAdapterService(){
         if (sAdapterService != null && !sAdapterService.mCleaningUp) {
@@ -172,6 +186,7 @@ public class AdapterService extends Service {
     private PowerManager mPowerManager;
     private PowerManager.WakeLock mWakeLock;
     private String mWakeLockName;
+    private HashSet<String> mDisabledProfiles = new HashSet<String>();
 
     public AdapterService() {
         super();
@@ -210,6 +225,7 @@ public class AdapterService extends Service {
     private void processInitProfilePriorities (BluetoothDevice device, ParcelUuid[] uuids){
         HidService hidService = HidService.getHidService();
         A2dpService a2dpService = A2dpService.getA2dpService();
+        A2dpSinkService a2dpSinkService = A2dpSinkService.getA2dpSinkService();
         HeadsetService headsetService = HeadsetService.getHeadsetService();
 
         // Set profile priorities only for the profiles discovered on the remote device.
@@ -223,10 +239,17 @@ public class AdapterService extends Service {
 
         // If we do not have a stored priority for A2DP then default to on.
         if ((a2dpService != null) &&
-            (BluetoothUuid.isUuidPresent(uuids, BluetoothUuid.AudioSink) ||
+            ((BluetoothUuid.isUuidPresent(uuids, BluetoothUuid.AudioSink) ||
             BluetoothUuid.isUuidPresent(uuids, BluetoothUuid.AdvAudioDist)) &&
-            (a2dpService.getPriority(device) == BluetoothProfile.PRIORITY_UNDEFINED)){
+            (a2dpService.getPriority(device) == BluetoothProfile.PRIORITY_UNDEFINED))){
             a2dpService.setPriority(device,BluetoothProfile.PRIORITY_ON);
+        }
+
+        if ((a2dpSinkService != null) &&
+            ((BluetoothUuid.isUuidPresent(uuids, BluetoothUuid.AudioSource) ||
+                BluetoothUuid.isUuidPresent(uuids, BluetoothUuid.AdvAudioDist)) &&
+            (a2dpSinkService.getPriority(device) == BluetoothProfile.PRIORITY_UNDEFINED))){
+            a2dpSinkService.setPriority(device,BluetoothProfile.PRIORITY_ON);
         }
 
         if ((headsetService != null) &&
@@ -242,6 +265,9 @@ public class AdapterService extends Service {
              (newState == BluetoothProfile.STATE_CONNECTED)){
             debugLog( "Profile connected. Schedule missing profile connection if any");
             connectOtherProfile(device, PROFILE_CONN_CONNECTED);
+            setProfileAutoConnectionPriority(device, profileId);
+        }
+        if ((profileId == BluetoothProfile.A2DP_SINK) && (newState == BluetoothProfile.STATE_CONNECTED)) {
             setProfileAutoConnectionPriority(device, profileId);
         }
         IBluetooth.Stub binder = mBinder;
@@ -310,7 +336,8 @@ public class AdapterService extends Service {
                 Iterator<Map.Entry<String,Integer>> i = mProfileServicesState.entrySet().iterator();
                 while (i.hasNext()) {
                     Map.Entry<String,Integer> entry = i.next();
-                    if (BluetoothAdapter.STATE_ON != entry.getValue()) {
+                    if (BluetoothAdapter.STATE_ON != entry.getValue()
+                            && !mDisabledProfiles.contains(entry.getKey())) {
                         debugLog("onProfileServiceStateChange() - Profile still not running:"
                             + entry.getKey());
                         return;
@@ -350,9 +377,12 @@ public class AdapterService extends Service {
         return mBinder;
     }
     public boolean onUnbind(Intent intent) {
-        debugLog("onUnbind() - calling cleanup");
-        cleanup();
-        return super.onUnbind(intent);
+        if (getState() == BluetoothAdapter.STATE_OFF) {
+            if (DBG) debugLog("onUnbind, calling cleanup");
+            cleanup();
+            return super.onUnbind(intent);
+        }
+        return false;
     }
 
     public void onDestroy() {
@@ -366,16 +396,22 @@ public class AdapterService extends Service {
         for (int i=0; i < supportedProfileServices.length;i++) {
             mProfileServicesState.put(supportedProfileServices[i].getName(),BluetoothAdapter.STATE_OFF);
         }
-        mRemoteDevices = new RemoteDevices(this);
+        mRemoteDevices = new RemoteDevices(mPowerManager, this);
         mAdapterProperties.init(mRemoteDevices);
 
         debugLog("processStart() - Make Bond State Machine");
-        mBondStateMachine = BondStateMachine.make(this, mAdapterProperties, mRemoteDevices);
+        mBondStateMachine = BondStateMachine.make(mPowerManager, this, mAdapterProperties, mRemoteDevices);
 
         mJniCallbacks.init(mBondStateMachine,mRemoteDevices);
 
         //FIXME: Set static instance here???
         setAdapterService(this);
+
+        checkA2dpState();
+
+        checkHidState();
+
+        checkHfpState();
 
         //Start profile services
         if (!mProfilesStarted && supportedProfileServices.length >0) {
@@ -475,6 +511,10 @@ public class AdapterService extends Service {
             mProfileServicesState.clear();
         }
 
+        if (mDisabledProfiles != null) {
+            mDisabledProfiles.clear();
+        }
+
         clearAdapterService();
 
         if (mBinder != null) {
@@ -487,14 +527,16 @@ public class AdapterService extends Service {
         }
 
         debugLog("cleanup() - Bluetooth process exited normally.");
-        System.exit(0);
     }
 
-    private static final int MESSAGE_PROFILE_SERVICE_STATE_CHANGED =1;
-    private static final int MESSAGE_PROFILE_CONNECTION_STATE_CHANGED=20;
+    private static final int MESSAGE_PROFILE_SERVICE_STATE_CHANGED = 1;
+    private static final int MESSAGE_PROFILE_CONNECTION_STATE_CHANGED = 20;
     private static final int MESSAGE_CONNECT_OTHER_PROFILES = 30;
     private static final int MESSAGE_PROFILE_INIT_PRIORITIES=40;
     private static final int CONNECT_OTHER_PROFILES_TIMEOUT= 6000;
+    private static final int CONNECT_OTHER_PROFILES_TIMEOUT_DEYALED = 10000;
+    private static final int MESSAGE_AUTO_CONNECT_PROFILES = 50;
+    private static final int AUTO_CONNECT_PROFILES_TIMEOUT = 500;
 
     private final Handler mHandler = new Handler() {
         @Override
@@ -527,6 +569,11 @@ public class AdapterService extends Service {
                     processConnectOtherProfiles((BluetoothDevice) msg.obj,msg.arg1);
                 }
                     break;
+                case MESSAGE_AUTO_CONNECT_PROFILES: {
+                    if (DBG) debugLog( "MESSAGE_AUTO_CONNECT_PROFILES");
+                    autoConnectProfilesDelayed();
+                    break;
+                }
             }
         }
     };
@@ -560,10 +607,21 @@ public class AdapterService extends Service {
                 + (state == BluetoothAdapter.STATE_OFF ? "Stopping" : "Starting")
                 + " service " + serviceName);
 
+            if (state == BluetoothAdapter.STATE_ON && mDisabledProfiles.contains(serviceName)) {
+                Log.i(TAG, "skipping " + serviceName + " (disabled)");
+                continue;
+            }
+
+            if (DBG) {
+                Log.w(TAG, (state == BluetoothAdapter.STATE_OFF? "Stopping" : "Starting" ) +" service " +
+                        serviceName);
+            }
+
             mProfileServicesState.put(serviceName,pendingState);
             Intent intent = new Intent(this,services[i]);
             intent.putExtra(EXTRA_ACTION,ACTION_SERVICE_STATE_CHANGED);
             intent.putExtra(BluetoothAdapter.EXTRA_STATE,state);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
             startService(intent);
         }
     }
@@ -894,6 +952,31 @@ public class AdapterService extends Service {
             return service.setRemoteAlias(device, name);
         }
 
+        public boolean getRemoteTrust(BluetoothDevice device) {
+            Log.d(TAG,"getRemoteTrust");
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"getRemoteTrust(): not allowed for non-active user");
+                return false;
+            }
+
+            AdapterService service = getService();
+            if (service == null) return false;
+            return service.getRemoteTrust(device);
+        }
+
+
+        public boolean setRemoteTrust(BluetoothDevice device, boolean trustValue) {
+            Log.d(TAG,"setRemoteTrust to "+ trustValue);
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"setRemoteTrust(): not allowed for non-active user");
+                return false;
+            }
+
+            AdapterService service = getService();
+            if (service == null) return false;
+            return service.setRemoteTrust(device, trustValue);
+        }
+
         public int getRemoteClass(BluetoothDevice device) {
             if (!Utils.checkCaller()) {
                 Log.w(TAG, "getRemoteClass() - Not allowed for non-active user");
@@ -1045,6 +1128,40 @@ public class AdapterService extends Service {
             if (service == null) return null;
             return service.createSocketChannel(type, serviceName, uuid, port, flag);
         }
+
+        public int setSocketOpt(int type, int channel, int optionName, byte [] optionVal,
+                                                    int optionLen) {
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"setSocketOpt(): not allowed for non-active user");
+                return -1;
+            }
+
+            AdapterService service = getService();
+            if (service == null) return -1;
+            return service.setSocketOpt(type, channel, optionName, optionVal, optionLen);
+        }
+
+        public int getSocketOpt(int type, int channel, int optionName, byte [] optionVal) {
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"getSocketOpt(): not allowed for non-active user");
+                return -1;
+            }
+
+            AdapterService service = getService();
+            if (service == null) return -1;
+            return service.getSocketOpt(type, channel, optionName, optionVal);
+        }
+
+        public BluetoothRemoteDiRecord getRemoteDiRecord(BluetoothDevice device) {
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"getRemoteDiRecord: not allowed for non-active user");
+                return null;
+            }
+            AdapterService service = getService();
+            if (service == null) return null;
+            return service.getRemoteDiRecord(device);
+        }
+
 
         public boolean configHciSnoopLog(boolean enable) {
             if ((Binder.getCallingUid() != Process.SYSTEM_UID) &&
@@ -1280,19 +1397,37 @@ public class AdapterService extends Service {
           return mQuietmode;
      }
 
-     public void autoConnect(){
+    // Delaying Auto Connect to make sure that all clients
+    // are up and running, specially BluetoothHeadset.
+    public void autoConnect() {
+        if (DBG) debugLog( "delay auto connect by 500 ms");
+        if ((mHandler.hasMessages(MESSAGE_AUTO_CONNECT_PROFILES) == false) &&
+            (isQuietModeEnabled()== false)) {
+            Message m = mHandler.obtainMessage(MESSAGE_AUTO_CONNECT_PROFILES);
+            mHandler.sendMessageDelayed(m,AUTO_CONNECT_PROFILES_TIMEOUT);
+        }
+    }
+
+    private void autoConnectProfilesDelayed(){
         if (getState() != BluetoothAdapter.STATE_ON){
-             errorLog("autoConnect() - BT is not ON. Exiting autoConnect");
-             return;
-         }
-         if (isQuietModeEnabled() == false) {
-             debugLog( "autoConnect() - Initiate auto connection on BT on...");
-             autoConnectHeadset();
-             autoConnectA2dp();
-         }
-         else {
-             debugLog( "autoConnect() - BT is in quiet mode. Not initiating auto connections");
-         }
+            errorLog("BT is not ON. Exiting autoConnect");
+            return;
+        }
+        if (isQuietModeEnabled() == false) {
+            if (DBG) debugLog( "Initiate auto connection on BT on...");
+            autoConnectHeadset();
+            autoConnectA2dp();
+            autoConnectA2dpSink();
+        }
+        else {
+            if (DBG) debugLog( "BT is in Quiet mode. Not initiating  auto connections");
+        }
+    }
+
+     private void cancelDiscoveryforautoConnect(){
+        if (mAdapterProperties.isDiscovering() == true) {
+            cancelDiscovery();
+        }
     }
 
      private void autoConnectHeadset(){
@@ -1304,6 +1439,7 @@ public class AdapterService extends Service {
         }
         for (BluetoothDevice device : bondedDevices) {
             if (hsService.getPriority(device) == BluetoothProfile.PRIORITY_AUTO_CONNECT ){
+                cancelDiscoveryforautoConnect();
                 debugLog("autoConnectHeadset() - Connecting HFP with " + device.toString());
                 hsService.connect(device);
             }
@@ -1318,23 +1454,59 @@ public class AdapterService extends Service {
         }
         for (BluetoothDevice device : bondedDevices) {
             if (a2dpSservice.getPriority(device) == BluetoothProfile.PRIORITY_AUTO_CONNECT ){
+                cancelDiscoveryforautoConnect();
                 debugLog("autoConnectA2dp() - Connecting A2DP with " + device.toString());
                 a2dpSservice.connect(device);
             }
         }
     }
 
+     private void autoConnectA2dpSink(){
+         A2dpSinkService a2dpSinkService = A2dpSinkService.getA2dpSinkService();
+         BluetoothDevice bondedDevices[] = getBondedDevices();
+         if ((bondedDevices == null) ||(a2dpSinkService == null)) {
+             return;
+         }
+         for (BluetoothDevice device : bondedDevices) {
+             if (a2dpSinkService.getPriority(device) == BluetoothProfile.PRIORITY_AUTO_CONNECT ){
+                 cancelDiscoveryforautoConnect();
+                 a2dpSinkService.connect(device);
+             }
+         }
+     }
+
      public void connectOtherProfile(BluetoothDevice device, int firstProfileStatus){
-        if ((mHandler.hasMessages(MESSAGE_CONNECT_OTHER_PROFILES) == false) &&
-            (isQuietModeEnabled()== false)){
+        String deviceAddress = device.getAddress();
+        boolean isConnectionTimeoutDelayed = false;
+
+        for (int i = 0; i < delayConnectTimeoutDevice.length;i++) {
+            if (deviceAddress.indexOf(delayConnectTimeoutDevice[i]) == 0) {
+                isConnectionTimeoutDelayed = true;
+            }
+        }
+        if (mHandler.hasMessages(MESSAGE_CONNECT_OTHER_PROFILES, device) == false) {
+            ParcelUuid[] featureUuids = device.getUuids();
+            // Some Carkits disconnect just after pairing,Initiate SDP for missing UUID's support
+            if ((!(BluetoothUuid.containsAnyUuid(featureUuids, A2DP_SOURCE_SINK_UUIDS))) ||
+                    (!(BluetoothUuid.isUuidPresent(featureUuids, BluetoothUuid.Handsfree)))) {
+                Log.v(TAG,"Initiate SDP for Missing UUID's support in remote");
+                device.fetchUuidsWithSdp();
+            }
             Message m = mHandler.obtainMessage(MESSAGE_CONNECT_OTHER_PROFILES);
             m.obj = device;
             m.arg1 = (int)firstProfileStatus;
-            mHandler.sendMessageDelayed(m,CONNECT_OTHER_PROFILES_TIMEOUT);
+            if (isConnectionTimeoutDelayed) {
+                mHandler.sendMessageDelayed(m,CONNECT_OTHER_PROFILES_TIMEOUT_DEYALED);
+            }
+            else {
+                mHandler.sendMessageDelayed(m,CONNECT_OTHER_PROFILES_TIMEOUT);
+            }
         }
     }
 
      private void processConnectOtherProfiles (BluetoothDevice device, int firstProfileStatus){
+        // initiate connection for missing profile on device
+        Log.i(TAG,"device is " + device);
         if (getState()!= BluetoothAdapter.STATE_ON){
             return;
         }
@@ -1345,6 +1517,8 @@ public class AdapterService extends Service {
         if ((hsService == null) ||(a2dpService == null )){
             return;
         }
+        boolean hsConnected = false;
+        boolean a2dpConnected =  false;
         List<BluetoothDevice> a2dpConnDevList= a2dpService.getConnectedDevices();
         List<BluetoothDevice> hfConnDevList= hsService.getConnectedDevices();
         // Check if the device is in disconnected state and if so return
@@ -1356,18 +1530,66 @@ public class AdapterService extends Service {
             (PROFILE_CONN_CONNECTED  == firstProfileStatus)){
             return;
         }
-        if((hfConnDevList.isEmpty()) &&
-            (hsService.getPriority(device) >= BluetoothProfile.PRIORITY_ON)){
-            hsService.connect(device);
+        if(!a2dpConnDevList.isEmpty()) {
+            for (BluetoothDevice a2dpDevice : a2dpConnDevList)
+            {
+                if(a2dpDevice.equals(device))
+                {
+                    a2dpConnected = true;
+                }
+            }
+        }
+        if(!hfConnDevList.isEmpty()) {
+            for (BluetoothDevice hsDevice : hfConnDevList)
+            {
+                if(hsDevice.equals(device))
+                {
+                    hsConnected = true;
+                }
+            }
+        }
+       // This change makes sure that we try to re-connect
+       // the profile if its connection failed and priority
+       // for desired profile is ON.
+        Log.i(TAG, "HF connected for device : " + device + " " + hfConnDevList.contains(device));
+        Log.i(TAG, "A2DP connected for device : " + device + " " + a2dpConnDevList.contains(device));
+        if((hfConnDevList.isEmpty() || !(hfConnDevList.contains(device))) &&
+            (hsService.getPriority(device) >= BluetoothProfile.PRIORITY_ON) &&
+            (a2dpConnected || (a2dpService.getPriority(device) == BluetoothProfile.PRIORITY_OFF))) {
+            int maxHfpConnectionSysProp =
+                    SystemProperties.getInt("persist.bt.max.hs.connections", 1);
+
+            if (!hfConnDevList.isEmpty() && maxHfpConnectionSysProp == 1) {
+                Log.v(TAG,"HFP is already connected, ignore");
+                return;
+            }
+
+            // proceed connection only if a2dp is connected to this device
+            // add here as if is already overloaded
+            if (a2dpConnDevList.contains(device) ||
+                (hsService.getPriority(device) >= BluetoothProfile.PRIORITY_ON)) {
+                hsService.connect(device);
+            } else {
+                Log.d(TAG, "do not initiate connect as A2dp is not connected");
+            }
         }
         else if((a2dpConnDevList.isEmpty()) &&
-            (a2dpService.getPriority(device) >= BluetoothProfile.PRIORITY_ON)){
-            a2dpService.connect(device);
+            (a2dpService.getPriority(device) >= BluetoothProfile.PRIORITY_ON) &&
+            (hsConnected || (hsService.getPriority(device) == BluetoothProfile.PRIORITY_OFF))) {
+
+            // proceed connection only if HFP is connected to this device
+            // add here as if is already overloaded
+            if (hfConnDevList.contains(device) ||
+                (a2dpService.getPriority(device) >= BluetoothProfile.PRIORITY_ON)) {
+                a2dpService.connect(device);
+            } else {
+                Log.v(TAG,"do not initiate connect as HFP is not connected");
+            }
         }
     }
 
      private void adjustOtherHeadsetPriorities(HeadsetService  hsService,
-                                                    List<BluetoothDevice> connectedDeviceList) {
+            List<BluetoothDevice> connectedDeviceList) {
         for (BluetoothDevice device : getBondedDevices()) {
            if (hsService.getPriority(device) >= BluetoothProfile.PRIORITY_AUTO_CONNECT &&
                !connectedDeviceList.contains(device)) {
@@ -1377,21 +1599,31 @@ public class AdapterService extends Service {
      }
 
      private void adjustOtherSinkPriorities(A2dpService a2dpService,
-                                                BluetoothDevice connectedDevice) {
+            List<BluetoothDevice> connectedDeviceList) {
          for (BluetoothDevice device : getBondedDevices()) {
              if (a2dpService.getPriority(device) >= BluetoothProfile.PRIORITY_AUTO_CONNECT &&
-                 !device.equals(connectedDevice)) {
+                 !connectedDeviceList.contains(device)) {
                  a2dpService.setPriority(device, BluetoothProfile.PRIORITY_ON);
              }
+         }
+     }
+
+     private void adjustOtherSrcPriorities(A2dpSinkService a2dpSinkService,
+                                               BluetoothDevice connectedDevice) {
+         for (BluetoothDevice device : getBondedDevices()) {
+             if (a2dpSinkService.getPriority(device) >= BluetoothProfile.PRIORITY_AUTO_CONNECT &&
+                  !device.equals(connectedDevice)) {
+                a2dpSinkService.setPriority(device, BluetoothProfile.PRIORITY_ON);
+            }
          }
      }
 
      void setProfileAutoConnectionPriority (BluetoothDevice device, int profileId){
          if (profileId == BluetoothProfile.HEADSET) {
              HeadsetService  hsService = HeadsetService.getHeadsetService();
-             List<BluetoothDevice> deviceList = hsService.getConnectedDevices();
              if ((hsService != null) &&
                 (BluetoothProfile.PRIORITY_AUTO_CONNECT != hsService.getPriority(device))){
+                 List<BluetoothDevice> deviceList = hsService.getConnectedDevices();
                  adjustOtherHeadsetPriorities(hsService, deviceList);
                  hsService.setPriority(device,BluetoothProfile.PRIORITY_AUTO_CONNECT);
              }
@@ -1400,8 +1632,17 @@ public class AdapterService extends Service {
              A2dpService a2dpService = A2dpService.getA2dpService();
              if ((a2dpService != null) &&
                 (BluetoothProfile.PRIORITY_AUTO_CONNECT != a2dpService.getPriority(device))){
-                 adjustOtherSinkPriorities(a2dpService, device);
+                 List<BluetoothDevice> deviceList = a2dpService.getConnectedDevices();
+                 adjustOtherSinkPriorities(a2dpService, deviceList);
                  a2dpService.setPriority(device,BluetoothProfile.PRIORITY_AUTO_CONNECT);
+             }
+         }
+         else if (profileId ==  BluetoothProfile.A2DP_SINK) {
+             A2dpSinkService a2dpSinkService = A2dpSinkService.getA2dpSinkService();
+             if ((a2dpSinkService != null) &&
+                (BluetoothProfile.PRIORITY_AUTO_CONNECT != a2dpSinkService.getPriority(device))){
+                 adjustOtherSrcPriorities(a2dpSinkService, device);
+                 a2dpSinkService.setPriority(device,BluetoothProfile.PRIORITY_AUTO_CONNECT);
              }
          }
     }
@@ -1465,6 +1706,21 @@ public class AdapterService extends Service {
         DeviceProperties deviceProp = mRemoteDevices.getDeviceProperties(device);
         if (deviceProp == null) return false;
         deviceProp.setAlias(name);
+        return true;
+    }
+
+    boolean getRemoteTrust(BluetoothDevice device) {
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+        DeviceProperties deviceProp = mRemoteDevices.getDeviceProperties(device);
+        if (deviceProp == null) return false;
+        return deviceProp.getTrust();
+    }
+
+    boolean setRemoteTrust(BluetoothDevice device, boolean trustValue) {
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+        DeviceProperties deviceProp = mRemoteDevices.getDeviceProperties(device);
+        if (deviceProp == null) return false;
+        deviceProp.setTrust(trustValue);
         return true;
     }
 
@@ -1539,8 +1795,7 @@ public class AdapterService extends Service {
         if (!pref.contains(device.getAddress())) {
             return BluetoothDevice.ACCESS_UNKNOWN;
         }
-        return pref.getBoolean(device.getAddress(), false)
-                ? BluetoothDevice.ACCESS_ALLOWED : BluetoothDevice.ACCESS_REJECTED;
+        return pref.getInt(device.getAddress(), BluetoothDevice.ACCESS_UNKNOWN);
     }
 
     boolean setPhonebookAccessPermission(BluetoothDevice device, int value) {
@@ -1552,7 +1807,7 @@ public class AdapterService extends Service {
         if (value == BluetoothDevice.ACCESS_UNKNOWN) {
             editor.remove(device.getAddress());
         } else {
-            editor.putBoolean(device.getAddress(), value == BluetoothDevice.ACCESS_ALLOWED);
+            editor.putInt(device.getAddress(), value);
         }
         return editor.commit();
     }
@@ -1592,6 +1847,13 @@ public class AdapterService extends Service {
 
     }
 
+    BluetoothRemoteDiRecord getRemoteDiRecord(BluetoothDevice device) {
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+        DeviceProperties deviceProp = mRemoteDevices.getDeviceProperties(device);
+        if (deviceProp == null) return null;
+        return deviceProp.getRemoteDiRecord();
+    }
+
      ParcelFileDescriptor connectSocket(BluetoothDevice device, int type,
                                               ParcelUuid uuid, int port, int flag) {
         enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
@@ -1615,6 +1877,19 @@ public class AdapterService extends Service {
         }
         return ParcelFileDescriptor.adoptFd(fd);
     }
+
+     int setSocketOpt(int type, int channel, int optionName, byte [] optionVal,
+             int optionLen) {
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+
+        return setSocketOptNative(type, channel, optionName, optionVal, optionLen);
+     }
+
+     int getSocketOpt(int type, int channel, int optionName, byte [] optionVal) {
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+
+        return getSocketOptNative(type, channel, optionName, optionVal);
+     }
 
     boolean configHciSnoopLog(boolean enable) {
         enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
@@ -1813,6 +2088,7 @@ public class AdapterService extends Service {
     private native static void classInitNative();
     private native boolean initNative();
     private native void cleanupNative();
+    /*package*/ native void ssrcleanupNative(boolean cleanup);
     /*package*/ native boolean enableNative();
     /*package*/ native boolean disableNative();
     /*package*/ native boolean setAdapterPropertyNative(int type, byte[] val);
@@ -1846,6 +2122,12 @@ public class AdapterService extends Service {
     private native int createSocketChannelNative(int type, String serviceName,
                                                  byte[] uuid, int port, int flag);
 
+    private native int setSocketOptNative(int fd, int type, int optionName,
+                                byte [] optionVal, int optionLen);
+
+    private native int  getSocketOptNative(int fd, int type, int optionName,
+                                byte [] optionVal);
+
     /*package*/ native boolean configHciSnoopLogNative(boolean enable);
 
     private native void alarmFiredNative();
@@ -1857,6 +2139,97 @@ public class AdapterService extends Service {
                 sRefCount--;
                 debugLog("finalize() - REFCOUNT: FINALIZED. INSTANCE_COUNT= " + sRefCount);
             }
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private synchronized void checkA2dpState() {
+        final Class a2dp_src[]  =  { A2dpService.class };
+        final Class a2dp_sink[] = { A2dpSinkService.class };
+
+        boolean isA2dpSinkEnabled = SystemProperties.getBoolean("persist.service.bt.a2dp.sink", false);
+        Log.d(TAG, "checkA2dpState: isA2dpSinkEnabled = " + isA2dpSinkEnabled);
+
+        if (isA2dpSinkEnabled) {
+            mDisabledProfiles.add(A2dpService.class.getName());
+            mDisabledProfiles.remove(A2dpSinkService.class.getName());
+        } else {
+            mDisabledProfiles.remove(A2dpService.class.getName());
+            mDisabledProfiles.add(A2dpSinkService.class.getName());
+        }
+
+        if (mAdapterStateMachine.isTurningOn() || mAdapterStateMachine.isTurningOff()) {
+            Log.e(TAG, "checkA2dpState: returning");
+            return;
+        }
+
+        if (isA2dpSinkEnabled) {
+            setProfileServiceState(a2dp_src, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(a2dp_sink, BluetoothAdapter.STATE_ON);
+        } else {
+            setProfileServiceState(a2dp_sink, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(a2dp_src, BluetoothAdapter.STATE_ON);
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private synchronized void checkHidState() {
+        final Class hh[] = { HidService.class };
+        final Class hd[] = { HidDevService.class };
+
+        boolean isHidDev = SystemProperties.getBoolean("persist.service.bdroid.hid.dev", false);
+        Log.d(TAG, "checkHidState: isHidDev = " + isHidDev);
+
+        if (isHidDev) {
+            mDisabledProfiles.add(HidService.class.getName());
+            mDisabledProfiles.remove(HidDevService.class.getName());
+        } else {
+            mDisabledProfiles.remove(HidService.class.getName());
+            mDisabledProfiles.add(HidDevService.class.getName());
+        }
+
+        if (mAdapterStateMachine.isTurningOn() || mAdapterStateMachine.isTurningOff()) {
+            Log.e(TAG, "checkHidState: returning");
+            return;
+        }
+
+        if (isHidDev) {
+            setProfileServiceState(hh, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(hd, BluetoothAdapter.STATE_ON);
+        } else {
+            setProfileServiceState(hd, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(hh, BluetoothAdapter.STATE_ON);
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private synchronized void checkHfpState() {
+        final Class hfp_ag[] = { HeadsetService.class };
+        final Class hfp_hs[] = { HeadsetClientService.class };
+
+        boolean isHfpClientEnabled = SystemProperties.getBoolean("persist.service.bt.hfp.client",
+                false);
+        Log.d(TAG, "checkHfpState: isHfpClientEnabled = " + isHfpClientEnabled);
+
+        if (isHfpClientEnabled) {
+            mDisabledProfiles.add(HeadsetService.class.getName());
+            mDisabledProfiles.remove(HeadsetClientService.class.getName());
+        } else {
+            mDisabledProfiles.remove(HeadsetService.class.getName());
+            mDisabledProfiles.add(HeadsetClientService.class.getName());
+        }
+
+        if (mAdapterStateMachine.isTurningOn() || mAdapterStateMachine.isTurningOff()) {
+            Log.e(TAG, "checkHfpState: returning");
+            return;
+        }
+
+        if (isHfpClientEnabled) {
+            setProfileServiceState(hfp_ag, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(hfp_hs, BluetoothAdapter.STATE_ON);
+        } else {
+            setProfileServiceState(hfp_hs, BluetoothAdapter.STATE_OFF);
+            setProfileServiceState(hfp_ag, BluetoothAdapter.STATE_ON);
         }
     }
 }

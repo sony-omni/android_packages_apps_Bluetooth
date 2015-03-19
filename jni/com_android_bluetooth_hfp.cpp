@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
  * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -485,6 +488,23 @@ static void initializeNative(JNIEnv *env, jobject object, jint max_hf_clients) {
     mCallbacksObj = env->NewGlobalRef(object);
 }
 
+static void initializeFeaturesNative(JNIEnv *env, jobject object, jint feature_bitmask) {
+    const bt_interface_t* btInf;
+    bt_status_t status;
+
+    if ( (btInf = getBluetoothInterface()) == NULL) {
+        ALOGE("Bluetooth module is not loaded");
+        return;
+    }
+    if (!sBluetoothHfpInterface) return ;
+    if (feature_bitmask)
+        if ((status = sBluetoothHfpInterface->init_features(feature_bitmask))
+            != BT_STATUS_SUCCESS){
+            ALOGE("Failed sending feature bitmask, status: %d", status);
+        }
+    return;
+}
+
 static void cleanupNative(JNIEnv *env, jobject object) {
     const bt_interface_t* btInf;
     bt_status_t status;
@@ -819,10 +839,27 @@ static jboolean configureWBSNative(JNIEnv *env, jobject object, jbyteArray addre
     return (status == BT_STATUS_SUCCESS) ? JNI_TRUE : JNI_FALSE;
 }
 
+static jint getRemoteFeaturesNative(JNIEnv *env, jobject object, jbyteArray address) {
+    jbyte *addr;
+    jint ret = 0;
+    if (!sBluetoothHfpInterface) return ret;
+
+    addr = env->GetByteArrayElements(address, NULL);
+    if (!addr) {
+        jniThrowIOException(env, EINVAL);
+        return ret;
+    }
+
+    ret = sBluetoothHfpInterface->get_remote_features((bt_bdaddr_t *) addr);
+    ALOGI (" Remote supported Features : %d", ret);
+    env->ReleaseByteArrayElements(address, addr, 0);
+    return ret;
+}
 
 static JNINativeMethod sMethods[] = {
     {"classInitNative", "()V", (void *) classInitNative},
     {"initializeNative", "(I)V", (void *) initializeNative},
+    {"initializeFeaturesNative", "(I)V", (void *) initializeFeaturesNative},
     {"cleanupNative", "()V", (void *) cleanupNative},
     {"connectHfpNative", "([B)Z", (void *) connectHfpNative},
     {"disconnectHfpNative", "([B)Z", (void *) disconnectHfpNative},
@@ -839,6 +876,7 @@ static JNINativeMethod sMethods[] = {
     {"clccResponseNative", "(IIIIZLjava/lang/String;I[B)Z", (void *) clccResponseNative},
     {"phoneStateChangeNative", "(IIILjava/lang/String;I)Z", (void *) phoneStateChangeNative},
     {"configureWBSNative", "([BI)Z", (void *) configureWBSNative},
+    {"getRemoteFeaturesNative", "([B)I", (void *) getRemoteFeaturesNative},
 };
 
 int register_com_android_bluetooth_hfp(JNIEnv* env)

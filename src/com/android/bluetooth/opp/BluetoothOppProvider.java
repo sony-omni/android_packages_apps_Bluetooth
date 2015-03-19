@@ -58,7 +58,7 @@ public final class BluetoothOppProvider extends ContentProvider {
 
     private static final String TAG = "BluetoothOppProvider";
     private static final boolean D = Constants.DEBUG;
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     /** Database filename */
     private static final String DB_NAME = "btopp.db";
@@ -228,6 +228,13 @@ public final class BluetoothOppProvider extends ContentProvider {
         }
     }
 
+    private static final void copyLong(String key, ContentValues from, ContentValues to) {
+        Long i = from.getAsLong(key);
+        if (i != null) {
+            to.put(key, i);
+        }
+    }
+
     @Override
     public Uri insert(Uri uri, ContentValues values) {
         SQLiteDatabase db = mOpenHelper.getWritableDatabase();
@@ -245,8 +252,7 @@ public final class BluetoothOppProvider extends ContentProvider {
         copyString(BluetoothShare.DESTINATION, values, filteredValues);
 
         copyInteger(BluetoothShare.VISIBILITY, values, filteredValues);
-        copyInteger(BluetoothShare.TOTAL_BYTES, values, filteredValues);
-
+        copyLong(BluetoothShare.TOTAL_BYTES, values, filteredValues);
         if (values.getAsInteger(BluetoothShare.VISIBILITY) == null) {
             filteredValues.put(BluetoothShare.VISIBILITY, BluetoothShare.VISIBILITY_VISIBLE);
         }

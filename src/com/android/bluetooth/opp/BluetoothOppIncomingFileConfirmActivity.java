@@ -61,7 +61,7 @@ public class BluetoothOppIncomingFileConfirmActivity extends AlertActivity imple
         DialogInterface.OnClickListener {
     private static final String TAG = "BluetoothIncomingFileConfirmActivity";
     private static final boolean D = Constants.DEBUG;
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     private static final int DISMISS_TIMEOUT_DIALOG = 0;
 
@@ -74,8 +74,6 @@ public class BluetoothOppIncomingFileConfirmActivity extends AlertActivity imple
     private Uri mUri;
 
     private ContentValues mUpdateValues;
-
-    private TextView mContentView;
 
     private boolean mTimeout = false;
 
@@ -200,8 +198,10 @@ public class BluetoothOppIncomingFileConfirmActivity extends AlertActivity imple
 
     private void onTimeout() {
         mTimeout = true;
-        mContentView.setText(getString(R.string.incoming_file_confirm_timeout_content,
-                mTransInfo.mDeviceName));
+        View view = getLayoutInflater().inflate(R.layout.incoming_dialog, null);
+
+        ((TextView)view.findViewById(R.id.from_content)).setText(
+                getString(R.string.incoming_file_confirm_timeout_content, mTransInfo.mDeviceName));
         mAlert.getButton(DialogInterface.BUTTON_NEGATIVE).setVisibility(View.GONE);
         mAlert.getButton(DialogInterface.BUTTON_POSITIVE).setText(
                 getString(R.string.incoming_file_confirm_timeout_ok));

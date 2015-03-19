@@ -703,7 +703,6 @@ final class HeadsetClientStateMachine extends StateMachine {
 
         if (mQueryCallsSupported) {
             sendMessage(QUERY_CURRENT_CALLS);
-            return;
         }
 
         BluetoothHeadsetClientCall c = null;
@@ -805,7 +804,9 @@ final class HeadsetClientStateMachine extends StateMachine {
         while (it.hasNext()) {
             Hashtable.Entry<Integer, BluetoothHeadsetClientCall> entry = it.next();
 
-            if (mCallsUpdate.containsKey(entry.getKey())) {
+            if (mCallsUpdate.containsKey(entry.getKey()) ||
+                    entry.getValue().getState() ==
+                    BluetoothHeadsetClientCall.CALL_STATE_HELD_BY_RESPONSE_AND_HOLD) {
                 continue;
             }
 
@@ -851,6 +852,11 @@ final class HeadsetClientStateMachine extends StateMachine {
             boolean outgoing) {
         Log.d(TAG, "queryCallsUpdate: " + id);
 
+        if (!mCalls.containsKey(id)) {
+            Log.d(TAG, "adding call " + id);
+            mCalls.put(id, new BluetoothHeadsetClientCall(id, state, number, multiParty,
+                    outgoing));
+        }
         // should not happen
         if (mCallsUpdate == null) {
             return;
@@ -951,9 +957,6 @@ final class HeadsetClientStateMachine extends StateMachine {
                 }
                 break;
             case BluetoothHeadsetClientCall.CALL_STATE_HELD_BY_RESPONSE_AND_HOLD:
-                if (flag != BluetoothHeadsetClient.CALL_ACCEPT_NONE) {
-                    return;
-                }
                 action = HeadsetClientHalConstants.CALL_ACTION_BTRH_1;
                 break;
             case BluetoothHeadsetClientCall.CALL_STATE_ALERTING:
@@ -1469,7 +1472,7 @@ final class HeadsetClientStateMachine extends StateMachine {
                     // Send AT+NREC to remote if supported by audio
                     if (HeadsetClientHalConstants.HANDSFREECLIENT_NREC_SUPPORTED) {
                         sendATCmdNative(HeadsetClientHalConstants.HANDSFREECLIENT_AT_CMD_NREC,
-                            1 , 0, null);
+                            1 , 0, "");
                     }
                     transitionTo(mConnected);
 
@@ -1616,7 +1619,7 @@ final class HeadsetClientStateMachine extends StateMachine {
                     }
                     break;
                 case REDIAL:
-                    if (dialNative(null)) {
+                    if (dialNative("")) {
                         addQueuedAction(REDIAL);
                     } else {
                         Log.e(TAG, "ERROR: Cannot redial");
@@ -1985,6 +1988,9 @@ final class HeadsetClientStateMachine extends StateMachine {
         private void processConnectionEvent(int state, BluetoothDevice device) {
             switch (state) {
                 case HeadsetClientHalConstants.CONNECTION_STATE_DISCONNECTED:
+                    if (mRingtone != null && mRingtone.isPlaying()) {
+                        mRingtone.stop();
+                    }
                     Log.d(TAG, "Connected disconnects.");
                     // AG disconnects
                     if (mCurrentDevice.equals(device)) {
@@ -2016,24 +2022,27 @@ final class HeadsetClientStateMachine extends StateMachine {
                     mAudioWbs = true;
                     // fall through
                 case HeadsetClientHalConstants.AUDIO_STATE_CONNECTED:
-                    mAudioState = BluetoothHeadsetClient.STATE_AUDIO_CONNECTED;
+                    int currMode = mAudioManager.getMode();
+                    Log.d(TAG,"currMode is " + currMode);
                     // request audio focus for call
                     if (mRingtone != null && mRingtone.isPlaying()) {
                         Log.d(TAG,"stopping ring and request focus for call");
                         mRingtone.stop();
                     }
-                    int newAudioMode = AudioManager.MODE_IN_CALL;
-                    int currMode = mAudioManager.getMode();
-                    if (currMode != newAudioMode) {
-                         // request audio focus before setting the new mode
-                         mAudioManager.requestAudioFocusForCall(AudioManager.STREAM_VOICE_CALL,
-                                 AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
-                         Log.d(TAG, "setAudioMode Setting audio mode from "
-                            + currMode + " to " + newAudioMode);
-                         mAudioManager.setMode(newAudioMode);
+                    if (currMode == AudioManager.MODE_IN_CALL ||
+                                currMode == AudioManager.MODE_IN_COMMUNICATION) {
+                        Log.d(TAG,"Telephony audio is active");
+                        disconnectAudioNative(getByteAddress(mCurrentDevice));
+                        break;
                     }
-                    Log.d(TAG,"hfp_enable=true");
-                    Log.d(TAG,"mAudioWbs is " + mAudioWbs);
+                    int newAudioMode = AudioManager.MODE_IN_CALL;
+                    // request audio focus before setting the new mode
+                    mAudioManager.requestAudioFocusForCall(AudioManager.STREAM_VOICE_CALL,
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+                    Log.d(TAG, "setAudioMode Setting audio mode from "
+                            + currMode + " to " + newAudioMode + "hfp_enable=true" +
+                            "mAudioWbs is " + mAudioWbs);
+                    mAudioManager.setMode(newAudioMode);
                     if (mAudioWbs) {
                         Log.d(TAG,"Setting sampling rate as 16000");
                         mAudioManager.setParameters("hfp_set_sampling_rate=16000");
@@ -2042,6 +2051,7 @@ final class HeadsetClientStateMachine extends StateMachine {
                         Log.d(TAG,"Setting sampling rate as 8000");
                         mAudioManager.setParameters("hfp_set_sampling_rate=8000");
                     }
+                    mAudioState = BluetoothHeadsetClient.STATE_AUDIO_CONNECTED;
                     mAudioManager.setParameters("hfp_enable=true");
                     broadcastAudioState(device, BluetoothHeadsetClient.STATE_AUDIO_CONNECTED,
                             BluetoothHeadsetClient.STATE_AUDIO_CONNECTING);
@@ -2138,6 +2148,32 @@ final class HeadsetClientStateMachine extends StateMachine {
                             Log.d(TAG, "AudioOn audio state changed" + event.device + ": "
                                     + event.valueInt);
                             processAudioEvent(event.valueInt, event.device);
+                            break;
+                        case EVENT_TYPE_RING_INDICATION:
+                            /* PTS test case TC_HF_ICA_BV_05_I creates SCO even
+                             * after disabling in-band ringtone, disconnect SCO
+                             * if inband ringtone is disabled */
+                            Log.i(TAG,"Ring Indication in Audio connected state " +
+                                    "mInBandRingtone " + mInBandRingtone);
+                            if (mInBandRingtone !=
+                                    HeadsetClientHalConstants.IN_BAND_RING_NOT_PROVIDED) {
+                                break;
+                            }
+                            if (disconnectAudioNative(getByteAddress(mCurrentDevice))) {
+                                mAudioState = BluetoothHeadsetClient.STATE_AUDIO_DISCONNECTED;
+                                //abandon audio focus
+                                if (mAudioManager.getMode() != AudioManager.MODE_NORMAL) {
+                                    mAudioManager.setMode(AudioManager.MODE_NORMAL);
+                                    Log.d(TAG, "abandonAudioFocus");
+                                    //abandon audio focus after the mode has been set back to normal
+                                    mAudioManager.abandonAudioFocusForCall();
+                                }
+                                Log.d(TAG,"hfp_enable=false");
+                                mAudioManager.setParameters("hfp_enable=false");
+                                broadcastAudioState(mCurrentDevice,
+                                        BluetoothHeadsetClient.STATE_AUDIO_DISCONNECTED,
+                                        BluetoothHeadsetClient.STATE_AUDIO_CONNECTED);
+                            }
                             break;
                         default:
                             return NOT_HANDLED;

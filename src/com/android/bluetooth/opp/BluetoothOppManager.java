@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
  * Copyright (c) 2008-2009, Motorola, Inc.
  *
  * All rights reserved.
@@ -59,7 +60,7 @@ import java.util.List;
  */
 public class BluetoothOppManager {
     private static final String TAG = "BluetoothOppManager";
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     private static BluetoothOppManager INSTANCE;
 
@@ -75,6 +76,8 @@ public class BluetoothOppManager {
     private String mMimeTypeOfSendingFile;
 
     private String mUriOfSendingFile;
+
+    private String mNameOfSendingFile;
 
     private String mMimeTypeOfSendingFiles;
 
@@ -106,7 +109,7 @@ public class BluetoothOppManager {
 
     public boolean mMultipleFlag;
 
-    private int mfileNumInBatch;
+    private int mfileNumInBatch = 1;
 
     private int mInsertShareThreadNum = 0;
 
@@ -116,6 +119,8 @@ public class BluetoothOppManager {
 
     // The time for which the whitelist entries remain valid.
     private static final int WHITELIST_DURATION_MS = 15000;
+
+    public boolean isA2DPPlaying;
 
     /**
      * Get singleton instance.
@@ -148,7 +153,7 @@ public class BluetoothOppManager {
 
         // Restore data from preference
         restoreApplicationData();
-
+        isA2DPPlaying = false;
         return true;
     }
 
@@ -257,6 +262,7 @@ public class BluetoothOppManager {
             uri = BluetoothOppUtility.generateUri(uri, sendFileInfo);
             BluetoothOppUtility.putSendFileInfo(uri, sendFileInfo);
             mUriOfSendingFile = uri.toString();
+            mNameOfSendingFile = sendFileInfo.mFileName;
             storeApplicationData();
         }
     }
@@ -275,6 +281,37 @@ public class BluetoothOppManager {
                 BluetoothOppUtility.putSendFileInfo(uri, sendFileInfo);
             }
             storeApplicationData();
+        }
+    }
+
+    public void cleanUpSendingFileInfo() {
+        synchronized (BluetoothOppManager.this) {
+            if (V) Log.v(TAG, "cleanUpSendingFileInfo: mMultipleFlag = " +
+                mMultipleFlag);
+            if (!mMultipleFlag) {
+                final Uri uri = Uri.parse(mUriOfSendingFile);
+                if (V) Log.v(TAG, "cleanUpSendingFileInfo: " +
+                        "closeSendFileInfo for uri = " + uri);
+                //Call closeSendFileInfo in a thread to avoid memory leak
+                Thread t = new Thread(new Runnable() {
+                    public void run () {
+                        BluetoothOppUtility.closeSendFileInfo(uri);
+                    }
+                });
+                t.start();
+            } else {
+                for (final Uri uri : mUrisOfSendingFiles) {
+                    if (V) Log.v(TAG, "cleanUpSendingFileInfo: " +
+                            "closeSendFileInfo for uri = " + uri);
+                    //Call closeSendFileInfo in a thread to avoid memory leak
+                    Thread t = new Thread(new Runnable() {
+                        public void run () {
+                            BluetoothOppUtility.closeSendFileInfo(uri);
+                        }
+                    });
+                    t.start();
+                }
+            }
         }
     }
 
@@ -313,9 +350,7 @@ public class BluetoothOppManager {
      * Get device name per bluetooth address.
      */
     public String getDeviceName(BluetoothDevice device) {
-        String deviceName;
-
-        deviceName = BluetoothOppPreference.getInstance(mContext).getName(device);
+        String deviceName = null;
 
         if (deviceName == null && mAdapter != null) {
             deviceName = device.getName();
@@ -354,7 +389,7 @@ public class BluetoothOppManager {
                 return;
             }
             insertThread = new InsertShareInfoThread(device, mMultipleFlag, mMimeTypeOfSendingFile,
-                    mUriOfSendingFile, mMimeTypeOfSendingFiles, mUrisOfSendingFiles,
+                    mUriOfSendingFile, mNameOfSendingFile, mMimeTypeOfSendingFiles, mUrisOfSendingFiles,
                     mIsHandoverInitiated);
             if (mMultipleFlag) {
                 mfileNumInBatch = mUrisOfSendingFiles.size();
@@ -379,6 +414,8 @@ public class BluetoothOppManager {
 
         private final String mUri;
 
+        private final String mNameOfSingleFile;
+
         private final String mTypeOfMultipleFiles;
 
         private final ArrayList<Uri> mUris;
@@ -388,13 +425,15 @@ public class BluetoothOppManager {
         private final boolean mIsHandoverInitiated;
 
         public InsertShareInfoThread(BluetoothDevice device, boolean multiple,
-                String typeOfSingleFile, String uri, String typeOfMultipleFiles,
-                ArrayList<Uri> uris, boolean handoverInitiated) {
+                String typeOfSingleFile, String uri, String nameOfSingleFile,
+                String typeOfMultipleFiles, ArrayList<Uri> uris,
+                boolean handoverInitiated) {
             super("Insert ShareInfo Thread");
             this.mRemoteDevice = device;
             this.mIsMultiple = multiple;
             this.mTypeOfSingleFile = typeOfSingleFile;
             this.mUri = uri;
+            this.mNameOfSingleFile = nameOfSingleFile;
             this.mTypeOfMultipleFiles = typeOfMultipleFiles;
             this.mUris = uris;
             this.mIsHandoverInitiated = handoverInitiated;
@@ -432,6 +471,7 @@ public class BluetoothOppManager {
             for (int i = 0; i < count; i++) {
                 Uri fileUri = mUris.get(i);
 
+                BluetoothOppSendFileInfo fileInfo = BluetoothOppUtility.getSendFileInfo(fileUri);
                 ContentValues values = new ContentValues();
                 values.put(BluetoothShare.URI, fileUri.toString());
 
@@ -442,10 +482,10 @@ public class BluetoothOppManager {
                 if (TextUtils.isEmpty(contentType)) {
                     contentType = mTypeOfMultipleFiles;
                 }
-
                 values.put(BluetoothShare.MIMETYPE, contentType);
                 values.put(BluetoothShare.DESTINATION, mRemoteDevice.getAddress());
                 values.put(BluetoothShare.TIMESTAMP, ts);
+                values.put(BluetoothShare.FILENAME_HINT, fileInfo.mFileName);
                 if (mIsHandoverInitiated) {
                     values.put(BluetoothShare.USER_CONFIRMATION,
                             BluetoothShare.USER_CONFIRMATION_HANDOVER_CONFIRMED);
@@ -463,6 +503,7 @@ public class BluetoothOppManager {
         private void insertSingleShare() {
             ContentValues values = new ContentValues();
             values.put(BluetoothShare.URI, mUri);
+            values.put(BluetoothShare.FILENAME_HINT, mNameOfSingleFile);
             values.put(BluetoothShare.MIMETYPE, mTypeOfSingleFile);
             values.put(BluetoothShare.DESTINATION, mRemoteDevice.getAddress());
             if (mIsHandoverInitiated) {

@@ -1,5 +1,6 @@
 /*
 * Copyright (C) 2013 Samsung System LSI
+* Copyright (C) 2013, The Linux Foundation. All rights reserved.
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
 * You may obtain a copy of the License at
@@ -13,9 +14,18 @@
 * limitations under the License.
 */
 package com.android.bluetooth.map;
-
 import android.util.Log;
-
+import android.net.Uri;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.*;
+import android.content.Context;
+import android.content.Intent;
+import android.database.Cursor;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.database.sqlite.SQLiteException;
+import com.android.emailcommon.provider.Mailbox;
 
 /**
  * Various utility methods and generic defines that can be used throughout MAPS
@@ -23,18 +33,32 @@ import android.util.Log;
 public class BluetoothMapUtils {
 
     private static final String TAG = "MapUtils";
-    private static final boolean D = BluetoothMapService.DEBUG;
-    private static final boolean V = BluetoothMapService.VERBOSE;
-    /* We use the upper 4 bits for the type mask.
-     * TODO: When more types are needed, consider just using a number
-     *       in stead of a bit to indicate the message type. Then 4
-     *       bit can be use for 16 different message types.
+    private static final boolean V = Log.isLoggable(BluetoothMapService.LOG_TAG, Log.VERBOSE) ? true : false;
+    /* We use the upper 5 bits for the type mask - avoid using the top bit, since it
+     * indicates a negative value, hence corrupting the formatter when converting to
+     * type String. (I really miss the unsigned type in Java:))
      */
-    private static final long HANDLE_TYPE_MASK            = (((long)0xf)<<56);
-    private static final long HANDLE_TYPE_MMS_MASK        = (((long)0x1)<<56);
-    private static final long HANDLE_TYPE_EMAIL_MASK      = (((long)0x2)<<56);
-    private static final long HANDLE_TYPE_SMS_GSM_MASK    = (((long)0x4)<<56);
-    private static final long HANDLE_TYPE_SMS_CDMA_MASK   = (((long)0x8)<<56);
+    private static final long HANDLE_TYPE_MASK            = 0xf<<59;
+    private static final long HANDLE_TYPE_MMS_MASK        = 0x1<<59;
+    private static final long HANDLE_TYPE_EMAIL_MASK      = 0x2<<59;
+    private static final long HANDLE_TYPE_SMS_GSM_MASK    = 0x4<<59;
+    private static final long HANDLE_TYPE_SMS_CDMA_MASK   = 0x8<<59;
+    public static final String AUTHORITY = "com.android.email.provider";
+    public static final Uri EMAIL_URI = Uri.parse("content://" + AUTHORITY);
+    public static final Uri EMAIL_ACCOUNT_URI = Uri.withAppendedPath(EMAIL_URI, "account");
+    public static final String RECORD_ID = "_id";
+    public static final String DISPLAY_NAME = "displayName";
+    public static final String EMAIL_ADDRESS = "emailAddress";
+    public static final String ACCOUNT_KEY = "accountKey";
+    public static final String IS_DEFAULT = "isDefault";
+    public static final String EMAIL_TYPE = "type";
+    public static final String[] EMAIL_BOX_PROJECTION = new String[] {
+        RECORD_ID, DISPLAY_NAME, ACCOUNT_KEY, EMAIL_TYPE };
+    private static Context mContext;
+    private static ContentResolver mResolver;
+    private static final String[] ACCOUNT_ID_PROJECTION = new String[] {
+                         RECORD_ID, EMAIL_ADDRESS, IS_DEFAULT
+    };
 
     /**
      * This enum is used to convert from the bMessage type property to a type safe
@@ -47,52 +71,80 @@ public class BluetoothMapUtils {
         MMS
     }
 
-    public static String getLongAsString(long v) {
-        char[] result = new char[16];
-        int v1 = (int) (v & 0xffffffff);
-        int v2 = (int) ((v>>32) & 0xffffffff);
-        int c;
-        for (int i = 0; i < 8; i++) {
-            c = v2 & 0x0f;
-            c += (c < 10) ? '0' : ('A'-10);
-            result[7 - i] = (char) c;
-            v2 >>= 4;
-            c = v1 & 0x0f;
-            c += (c < 10) ? '0' : ('A'-10);
-            result[15 - i] = (char)c;
-            v1 >>= 4;
-        }
-        return new String(result);
-    }
-
     /**
      * Convert a Content Provider handle and a Messagetype into a unique handle
      * @param cpHandle content provider handle
      * @param messageType message type (TYPE_MMS/TYPE_SMS_GSM/TYPE_SMS_CDMA/TYPE_EMAIL)
      * @return String Formatted Map Handle
      */
-    public static String getMapHandle(long cpHandle, TYPE messageType){
+    static public String getMapHandle(long cpHandle, TYPE messageType){
         String mapHandle = "-1";
         switch(messageType)
         {
-
             case MMS:
-                mapHandle = getLongAsString(cpHandle | HANDLE_TYPE_MMS_MASK);
+                mapHandle = String.format("%016X",(cpHandle | HANDLE_TYPE_MMS_MASK));
                 break;
             case SMS_GSM:
-                mapHandle = getLongAsString(cpHandle | HANDLE_TYPE_SMS_GSM_MASK);
+                mapHandle = String.format("%016X",cpHandle | HANDLE_TYPE_SMS_GSM_MASK);
                 break;
             case SMS_CDMA:
-                mapHandle = getLongAsString(cpHandle | HANDLE_TYPE_SMS_CDMA_MASK);
+                mapHandle = String.format("%016X",cpHandle | HANDLE_TYPE_SMS_CDMA_MASK);
                 break;
             case EMAIL:
-                mapHandle = getLongAsString(cpHandle | HANDLE_TYPE_EMAIL_MASK);
+                mapHandle = String.format("%016X",(cpHandle | HANDLE_TYPE_EMAIL_MASK)); //TODO correct when email support is implemented
                 break;
                 default:
                     throw new IllegalArgumentException("Message type not supported");
         }
         return mapHandle;
 
+    }
+    public static int getSystemMailboxGuessType(String folderName) {
+
+        if(folderName.equalsIgnoreCase("outbox")){
+           return Mailbox.TYPE_OUTBOX;
+        } else if(folderName.equalsIgnoreCase("inbox")){
+           return Mailbox.TYPE_INBOX;
+        } else if(folderName.equalsIgnoreCase("drafts")){
+           return Mailbox.TYPE_DRAFTS;
+        } else if(folderName.equalsIgnoreCase("Trash")){
+           return Mailbox.TYPE_TRASH;
+        } else if(folderName.equalsIgnoreCase("Sent")){
+           return Mailbox.TYPE_SENT;
+        } else if(folderName.equalsIgnoreCase("Junk")){
+           return Mailbox.TYPE_JUNK;
+        } else if(folderName.equalsIgnoreCase("Sent")){
+           return Mailbox.TYPE_STARRED;
+        } else if(folderName.equalsIgnoreCase("Unread")){
+           return Mailbox.TYPE_UNREAD;
+        }
+        //UNKNOWN
+        return -1;
+      }
+    /**
+     * Get Account id for Default Email app
+     * @return the Account id value
+     */
+    static public long getEmailAccountId(Context context) {
+        if (V) Log.v(TAG, "getEmailAccountIdList()");
+        long id = -1;
+        ArrayList<Long> list = new ArrayList<Long>();
+        Context mContext = context;
+        mResolver = mContext.getContentResolver();
+        try {
+            Cursor cursor = mResolver.query(EMAIL_ACCOUNT_URI,
+                   ACCOUNT_ID_PROJECTION, null, null, null);
+            if (cursor != null) {
+                if (cursor.moveToFirst()) {
+                    id = cursor.getLong(0);
+                    if (V) Log.v(TAG, "id = " + id);
+                }
+                cursor.close();
+            }
+        } catch (SQLiteException e) {
+            Log.e(TAG, "SQLite exception: " + e);
+        }
+        return id;
     }
 
     /**
@@ -111,11 +163,8 @@ public class BluetoothMapUtils {
     static public long getCpHandle(String mapHandle)
     {
         long cpHandle = getMsgHandleAsLong(mapHandle);
-        if(D)Log.d(TAG,"-> MAP handle:"+mapHandle);
         /* remove masks as the call should already know what type of message this handle is for */
         cpHandle &= ~HANDLE_TYPE_MASK;
-        if(D)Log.d(TAG,"->CP handle:"+cpHandle);
-
         return cpHandle;
     }
 

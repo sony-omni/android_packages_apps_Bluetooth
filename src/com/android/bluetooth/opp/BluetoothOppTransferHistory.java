@@ -62,7 +62,7 @@ public class BluetoothOppTransferHistory extends Activity implements
         View.OnCreateContextMenuListener, OnItemClickListener {
     private static final String TAG = "BluetoothOppTransferHistory";
 
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     private ListView mListView;
 
@@ -210,6 +210,12 @@ public class BluetoothOppTransferHistory extends Activity implements
                 inflater.inflate(R.menu.transferhistorycontextfinished, menu);
             }
         }
+    }
+
+    @Override
+    public void onContextMenuClosed(Menu menu) {
+        super.onContextMenuClosed(menu);
+        mContextMenu = false;
     }
 
     /**

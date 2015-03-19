@@ -33,7 +33,7 @@
 package com.android.bluetooth.opp;
 
 import com.google.android.collect.Lists;
-import javax.obex.ObexTransport;
+import javax.btobex.ObexTransport;
 
 import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
@@ -46,6 +46,8 @@ import android.content.IntentFilter;
 import android.database.CharArrayBuffer;
 import android.database.ContentObserver;
 import android.database.Cursor;
+import android.database.CursorWindowAllocationException;
+import android.database.sqlite.SQLiteException;
 import android.media.MediaScannerConnection;
 import android.media.MediaScannerConnection.MediaScannerConnectionClient;
 import android.net.Uri;
@@ -53,6 +55,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.PowerManager;
+import java.io.File;
 import android.util.Log;
 import android.os.Process;
 
@@ -68,7 +71,7 @@ import java.util.ArrayList;
 
 public class BluetoothOppService extends Service {
     private static final boolean D = Constants.DEBUG;
-    private static final boolean V = Constants.VERBOSE;
+    private static boolean V;
 
     private boolean userAccepted = false;
 
@@ -93,7 +96,7 @@ public class BluetoothOppService extends Service {
     /** Class to handle Notification Manager updates */
     private BluetoothOppNotification mNotifier;
 
-    private boolean mPendingUpdate;
+    private boolean mPendingUpdate = true;
 
     private UpdateThread mUpdateThread;
 
@@ -121,7 +124,9 @@ public class BluetoothOppService extends Service {
 
     private PowerManager mPowerManager;
 
-    private BluetoothOppRfcommListener mSocketListener;
+    private BluetoothOppL2capListener mL2capSocketListener;
+
+    private BluetoothOppRfcommListener mRfcommSocketListener;
 
     private boolean mListenStarted = false;
 
@@ -146,9 +151,11 @@ public class BluetoothOppService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        if (V) Log.v(TAG, "onCreate");
+        if (V) Log.v(TAG, "Service onCreate");
         mAdapter = BluetoothAdapter.getDefaultAdapter();
-        mSocketListener = new BluetoothOppRfcommListener(mAdapter);
+        mL2capSocketListener = new BluetoothOppL2capListener(mAdapter);
+        mRfcommSocketListener = new BluetoothOppRfcommListener(mAdapter);
+
         mShares = Lists.newArrayList();
         mBatchs = Lists.newArrayList();
         mObserver = new BluetoothShareContentObserver();
@@ -156,12 +163,13 @@ public class BluetoothOppService extends Service {
         mBatchId = 1;
         mNotifier = new BluetoothOppNotification(this);
         mNotifier.mNotificationMgr.cancelAll();
-        mNotifier.updateNotification();
 
         final ContentResolver contentResolver = getContentResolver();
         new Thread("trimDatabase") {
             public void run() {
-                trimDatabase(contentResolver);
+                synchronized (BluetoothOppService.this) {
+                    trimDatabase(contentResolver);
+                }
             }
         }.start();
 
@@ -175,13 +183,16 @@ public class BluetoothOppService extends Service {
                 startListener();
             }
         }
-        if (V) BluetoothOppPreference.getInstance(this).dump();
+        if (V) {
+            BluetoothOppPreference mPreference = BluetoothOppPreference.getInstance(this);
+            if (mPreference != null) mPreference.dump();
+        }
         updateFromProvider();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (V) Log.v(TAG, "onStartCommand");
+        if (V) Log.v(TAG, "Service onStartCommand");
         //int retCode = super.onStartCommand(intent, flags, startId);
         //if (retCode == START_STICKY) {
             if (mAdapter == null) {
@@ -195,6 +206,8 @@ public class BluetoothOppService extends Service {
     }
 
     private void startListener() {
+        V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
+        if (V) Log.v(TAG, "startListener");
         if (!mListenStarted) {
             if (mAdapter.isEnabled()) {
                 if (V) Log.v(TAG, "Starting RfcommListener");
@@ -214,13 +227,35 @@ public class BluetoothOppService extends Service {
 
     private static final int STOP_LISTENER = 200;
 
+    /*
+     * Handler for cleaning up Pre Transfer conditons
+     */
+    private Handler mPreTransferHandler = new Handler() {
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case BluetoothOppObexServerSession.CLOSE_SERVER_SESSION:
+                    if ((mServerSession != null) && (mServerTransfer == null)) {
+                        if (V) Log.v(TAG, "Server session cleanup");
+                        mServerSession.stop();
+                        mServerSession = null;
+                    }
+                    break;
+            }
+        }
+    };
+
     private Handler mHandler = new Handler() {
         @Override
         public void handleMessage(Message msg) {
             switch (msg.what) {
                 case STOP_LISTENER:
-                    if(mSocketListener != null){
-                        mSocketListener.stop();
+                    //mSocketListener.stop();
+                    if(mRfcommSocketListener != null) {
+                        mRfcommSocketListener.stop();
+                    }
+                    if(mL2capSocketListener != null) {
+                        mL2capSocketListener.stop();
                     }
                     mListenStarted = false;
                     //Stop Active INBOUND Transfer
@@ -270,15 +305,18 @@ public class BluetoothOppService extends Service {
                     }
                     break;
                 case BluetoothOppRfcommListener.MSG_INCOMING_BTOPP_CONNECTION:
-                    if (D) Log.d(TAG, "Get incoming connection");
+                    if (D) Log.d(TAG, "Get incoming connection mBatchSz: "+ mBatchs.size());
                     ObexTransport transport = (ObexTransport)msg.obj;
+                    if(mServerTransfer == null){
+                         Log.d(TAG, "mServerTranser is NULL");
+                    }
                     /*
                      * Strategy for incoming connections:
-                     * 1. If there is no ongoing transfer, no on-hold connection, start it
-                     * 2. If there is ongoing transfer, hold it for 20 seconds(1 seconds * 20 times)
+                     * 1. If there is no active connection, no on-hold connection, start it
+                     * 2. If there is active connection, hold it for 20 seconds(1 seconds * 20 times)
                      * 3. If there is on-hold connection, reject directly
                      */
-                    if (mBatchs.size() == 0 && mPendingConnection == null) {
+                    if ((mServerSession == null) && (mPendingConnection == null)) {
                         Log.i(TAG, "Start Obex Server");
                         createServerSession(transport);
                     } else {
@@ -303,7 +341,7 @@ public class BluetoothOppService extends Service {
                     }
                     break;
                 case MSG_INCOMING_CONNECTION_RETRY:
-                    if (mBatchs.size() == 0) {
+                    if (mServerSession == null) {
                         Log.i(TAG, "Start Obex Server");
                         createServerSession(mPendingConnection);
                         mIncomingRetries = 0;
@@ -333,18 +371,20 @@ public class BluetoothOppService extends Service {
 
     private void startSocketListener() {
 
-        if (V) Log.v(TAG, "start RfcommListener");
-        mSocketListener.start(mHandler);
-        if (V) Log.v(TAG, "RfcommListener started");
+        if (V) Log.v(TAG, "start RFCOMM and L2CAP listeners");
+        mRfcommSocketListener.start(mHandler);
+        mL2capSocketListener.start(mHandler);
+        if (V) Log.d(TAG, "RFCOMM and L2CAP listeners started");
     }
 
     @Override
     public void onDestroy() {
-        if (V) Log.v(TAG, "onDestroy");
+        if (V) Log.v(TAG, "Service onDestroy");
         super.onDestroy();
         getContentResolver().unregisterContentObserver(mObserver);
         unregisterReceiver(mBluetoothReceiver);
-        mSocketListener.stop();
+        mRfcommSocketListener.stop();
+        mL2capSocketListener.stop();
 
         if(mBatchs != null) {
             mBatchs.clear();
@@ -360,7 +400,7 @@ public class BluetoothOppService extends Service {
     /* suppose we auto accept an incoming OPUSH connection */
     private void createServerSession(ObexTransport transport) {
         mServerSession = new BluetoothOppObexServerSession(this, transport);
-        mServerSession.preStart();
+        mServerSession.preStart(mPreTransferHandler);
         if (D) Log.d(TAG, "Get ServerSession " + mServerSession.toString()
                     + " for incoming connection" + transport.toString());
     }
@@ -379,6 +419,18 @@ public class BluetoothOppService extends Service {
                         break;
                     case BluetoothAdapter.STATE_TURNING_OFF:
                         if (V) Log.v(TAG, "Receiver DISABLED_ACTION ");
+
+                        if (mUpdateThread != null) {
+                            try {
+                                mUpdateThread.interrupt();
+                                mUpdateThread.join();
+                                mUpdateThread = null;
+                            } catch (InterruptedException ie) {
+                                Log.e(TAG, "OPPService Thread join interrupted");
+                            }
+                        }
+
+                        mNotifier.btOffNotification();
                         //FIX: Don't block main thread
                         /*
                         mSocketListener.stop();
@@ -398,9 +450,13 @@ public class BluetoothOppService extends Service {
     };
 
     private void updateFromProvider() {
+        if (V) Log.v(TAG, "Updating the provider");
         synchronized (BluetoothOppService.this) {
             mPendingUpdate = true;
-            if (mUpdateThread == null) {
+            if ((mUpdateThread == null) && (mAdapter != null)
+                && mAdapter.isEnabled()) {
+                if (V) Log.v(TAG, "Starting a new thread");
+                mPowerManager = (PowerManager)this.getSystemService(Context.POWER_SERVICE);
                 mUpdateThread = new UpdateThread();
                 mUpdateThread.start();
             }
@@ -417,26 +473,24 @@ public class BluetoothOppService extends Service {
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
 
             boolean keepService = false;
-            for (;;) {
+            do {
                 synchronized (BluetoothOppService.this) {
                     if (mUpdateThread != this) {
                         throw new IllegalStateException(
                                 "multiple UpdateThreads in BluetoothOppService");
                     }
-                    if (V) Log.v(TAG, "pendingUpdate is " + mPendingUpdate + " keepUpdateThread is "
-                                + keepService + " sListenStarted is " + mListenStarted);
-                    if (!mPendingUpdate) {
-                        mUpdateThread = null;
-                        if (!keepService && !mListenStarted) {
-                            stopSelf();
-                            break;
-                        }
-                        return;
-                    }
+                    if (V) Log.v(TAG, "keepUpdateThread is " + keepService + " sListenStarted is "
+                            + mListenStarted);
                     mPendingUpdate = false;
                 }
-                Cursor cursor = getContentResolver().query(BluetoothShare.CONTENT_URI, null, null,
-                        null, BluetoothShare._ID);
+                Cursor cursor;
+                try {
+                    cursor = getContentResolver().query(BluetoothShare.CONTENT_URI, null, null,
+                            null, BluetoothShare._ID);
+                } catch (SQLiteException e) {
+                    cursor = null;
+                    Log.e(TAG, "SQLite exception: " + e);
+                }
 
                 if (cursor == null) {
                     return;
@@ -449,7 +503,15 @@ public class BluetoothOppService extends Service {
                 keepService = false;
                 boolean isAfterLast = cursor.isAfterLast();
 
-                int idColumn = cursor.getColumnIndexOrThrow(BluetoothShare._ID);
+                int idColumn;
+                try {
+                    idColumn = cursor.getColumnIndexOrThrow(BluetoothShare._ID);
+                } catch (IllegalArgumentException e) {
+                    cursor.close();
+                    cursor = null;
+                    Log.e (TAG, "Invalid share ID");
+                    return;
+                }
                 /*
                  * Walk the cursor and the local array to keep them in sync. The
                  * key to the algorithm is that the ids are unique and sorted
@@ -512,6 +574,7 @@ public class BluetoothOppService extends Service {
                             } else if (arrayId == id) {
                                 // This cursor row already exists in the stored
                                 // array
+                                if(V) Log.v(TAG," Calling Updateshare arraypos " + arrayPos);
                                 updateShare(cursor, arrayPos, userAccepted);
                                 if (shouldScanFile(arrayPos) && (!scanFile(cursor, arrayPos))) {
                                     keepService = true;
@@ -552,9 +615,60 @@ public class BluetoothOppService extends Service {
                 mNotifier.updateNotification();
 
                 cursor.close();
+                cursor = null;
+
+                if (V) {
+                    if (mServerSession != null) {
+                        Log.v(TAG, "Server Session is active");
+                    } else {
+                        Log.v(TAG, "No active Server Session");
+                    }
+
+                    if (mTransfer != null) {
+                        Log.v(TAG, "Client Session is active");
+                    } else {
+                        Log.v(TAG, "No active Client Session");
+                    }
+                }
+
+                try {
+                    if (mPowerManager.isScreenOn()) {
+                        Thread.sleep(BluetoothShare.UI_UPDATE_INTERVAL);
+                    }
+                } catch (InterruptedException e) {
+                    if (V) Log.v(TAG, "OppService Thread sleep is interrupted (1), exiting");
+                    return;
+                }
+
+                if(V) Log.v(TAG, "PendingUpdate is " + mPendingUpdate);
+            } while (mPendingUpdate);
+
+            synchronized (BluetoothOppService.this) {
+                mUpdateThread = null;
+                if (!keepService && !mListenStarted) {
+                    if (V) Log.v(TAG, "Need to stop self");
+                    stopSelf();
+                }
+                if (V) Log.v(TAG, "***returning from updatethread***");
             }
         }
 
+    }
+
+    private BluetoothOppTransfer insertShareWithOngoingBatch(BluetoothOppTransfer transfer,
+                        BluetoothOppBatch batch, int arrayPos, BluetoothOppObexSession session) {
+        if(transfer == null) {
+            transfer = new BluetoothOppTransfer(this, mPowerManager, batch, session);
+            if (transfer != null) {
+                transfer.start();
+            } else {
+                Log.e(TAG, "Unexpected error! mTransfer is null");
+                mBatchs.remove(batch);
+                mBatchId--;
+                mShares.remove(arrayPos);
+            }
+        }
+        return transfer;
     }
 
     private void insertShare(Cursor cursor, int arrayPos) {
@@ -578,9 +692,9 @@ public class BluetoothOppService extends Service {
                 cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.VISIBILITY)),
                 cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION)),
                 cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.STATUS)),
-                cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES)),
-                cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.CURRENT_BYTES)),
-                cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.TIMESTAMP)),
+                cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES)),
+                cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.CURRENT_BYTES)),
+                cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.TIMESTAMP)),
                 cursor.getInt(cursor.getColumnIndexOrThrow(Constants.MEDIA_SCANNED)) != Constants.MEDIA_SCANNED_NOT_SCANNED);
 
         if (V) {
@@ -603,7 +717,6 @@ public class BluetoothOppService extends Service {
         }
 
         mShares.add(arrayPos, info);
-
         /* Mark the info as failed if it's in invalid status */
         if (info.isObsolete()) {
             Constants.updateShareStatus(this, info.mId, BluetoothShare.STATUS_UNKNOWN_ERROR);
@@ -662,15 +775,25 @@ public class BluetoothOppService extends Service {
                 if (i != -1) {
                     if (V) Log.v(TAG, "Service add info " + info.mId + " to existing batch "
                                 + mBatchs.get(i).mId);
+                    if (V) Log.v(TAG," Batch Status   " + info.mStatus);
                     mBatchs.get(i).addShare(info);
                 } else {
                     // There is ongoing batch
                     BluetoothOppBatch newBatch = new BluetoothOppBatch(this, info);
                     newBatch.mId = mBatchId;
                     mBatchId++;
+                    if (V) Log.v(TAG, "mBatchs.add(newBatch) start!!");
                     mBatchs.add(newBatch);
                     if (V) Log.v(TAG, "Service add new Batch " + newBatch.mId + " for info " +
                             info.mId);
+                    if (info.mDirection == BluetoothShare.DIRECTION_OUTBOUND) {
+                        mTransfer = insertShareWithOngoingBatch(mTransfer, newBatch, arrayPos,
+                            null);
+                    } else if (info.mDirection == BluetoothShare.DIRECTION_INBOUND) {
+                        mServerTransfer = insertShareWithOngoingBatch(mServerTransfer, newBatch,
+                            arrayPos, mServerSession);
+                    }
+
                     if (Constants.USE_TCP_DEBUG && !Constants.USE_TCP_SIMPLE_SERVER) {
                         // only allow  concurrent serverTransfer in debug mode
                         if (info.mDirection == BluetoothShare.DIRECTION_INBOUND) {
@@ -704,7 +827,7 @@ public class BluetoothOppService extends Service {
         info.mDestination = stringFromCursor(info.mDestination, cursor, BluetoothShare.DESTINATION);
         int newVisibility = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.VISIBILITY));
 
-        boolean confirmed = false;
+        boolean confirmUpdated = false;
         int newConfirm = cursor.getInt(cursor
                 .getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION));
 
@@ -717,33 +840,33 @@ public class BluetoothOppService extends Service {
         info.mVisibility = newVisibility;
 
         if (info.mConfirm == BluetoothShare.USER_CONFIRMATION_PENDING
-                && newConfirm != BluetoothShare.USER_CONFIRMATION_PENDING) {
-            confirmed = true;
+            && (newConfirm == BluetoothShare.USER_CONFIRMATION_CONFIRMED ||
+                newConfirm == BluetoothShare.USER_CONFIRMATION_AUTO_CONFIRMED ||
+                newConfirm == BluetoothShare.USER_CONFIRMATION_HANDOVER_CONFIRMED)) {
         }
-        info.mConfirm = cursor.getInt(cursor
-                .getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION));
+        info.mConfirm = newConfirm;
         int newStatus = cursor.getInt(statusColumn);
-
-        if (!BluetoothShare.isStatusCompleted(info.mStatus)
-                && BluetoothShare.isStatusCompleted(newStatus)) {
+        int oldStatus = info.mStatus;
+        if (BluetoothShare.isStatusCompleted(info.mStatus)) {
             mNotifier.mNotificationMgr.cancel(info.mId);
         }
 
+        if (V) Log.v(TAG," UpdateShare: oldStatus = " + oldStatus + " newStatus = " + newStatus);
         info.mStatus = newStatus;
-        info.mTotalBytes = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES));
-        info.mCurrentBytes = cursor.getInt(cursor
+        info.mTotalBytes = cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES));
+        info.mCurrentBytes = cursor.getLong(cursor
                 .getColumnIndexOrThrow(BluetoothShare.CURRENT_BYTES));
-        info.mTimestamp = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.TIMESTAMP));
+        info.mTimestamp = cursor.getLong(cursor.getColumnIndexOrThrow(BluetoothShare.TIMESTAMP));
         info.mMediaScanned = (cursor.getInt(cursor.getColumnIndexOrThrow(Constants.MEDIA_SCANNED)) != Constants.MEDIA_SCANNED_NOT_SCANNED);
 
-        if (confirmed) {
-            if (V) Log.v(TAG, "Service handle info " + info.mId + " confirmed");
-            /* Inbounds transfer get user confirmation, so we start it */
+        if (confirmUpdated) {
+            if (V) Log.v(TAG, "Service handle info " + info.mId + " confirmation updated");
+            /* Inbounds transfer user confirmation status changed, update the session server */
             int i = findBatchWithTimeStamp(info.mTimestamp);
             if (i != -1) {
                 BluetoothOppBatch batch = mBatchs.get(i);
                 if (mServerTransfer != null && batch.mId == mServerTransfer.getBatchId()) {
-                    mServerTransfer.setConfirmed();
+                    mServerTransfer.confirmStatusChanged();
                 } //TODO need to think about else
             }
         }
@@ -767,6 +890,7 @@ public class BluetoothOppService extends Service {
                     if (mServerTransfer == null) {
                         Log.e(TAG, "Unexpected error! mServerTransfer is null");
                     } else if (batch.mId == mServerTransfer.getBatchId()) {
+                        if(V) Log.v(TAG," Stopping Inbound Transfer ");
                         mServerTransfer.stop();
                     } else {
                         Log.e(TAG, "Unexpected error! batch id " + batch.mId
@@ -774,6 +898,7 @@ public class BluetoothOppService extends Service {
                                 + mServerTransfer.getBatchId());
                     }
                     mServerTransfer = null;
+                    mServerSession = null;
                 }
                 removeBatch(batch);
             }
@@ -799,6 +924,21 @@ public class BluetoothOppService extends Service {
                 if (V) Log.v(TAG, "Service cancel batch for share " + info.mId);
                 batch.cancelBatch();
             }
+
+            /* Server/Client transfer cleanup */
+            if ((batch.mDirection == BluetoothShare.DIRECTION_OUTBOUND)
+                    && (mTransfer != null)) {
+                if (V) Log.v(TAG, "Stop Client Transfer");
+                mTransfer.stop();
+                mTransfer = null;
+            } else if ((batch.mDirection == BluetoothShare.DIRECTION_INBOUND)
+                    && (mServerTransfer != null)) {
+                if (V) Log.v(TAG, "Stop Server Transfer");
+                mServerTransfer.stop();
+                mServerTransfer = null;
+                mServerSession = null;
+            }
+
             if (batch.isEmpty()) {
                 if (V) Log.v(TAG, "Service remove batch  " + batch.mId);
                 removeBatch(batch);
@@ -846,16 +986,16 @@ public class BluetoothOppService extends Service {
     private void removeBatch(BluetoothOppBatch batch) {
         if (V) Log.v(TAG, "Remove batch " + batch.mId);
         mBatchs.remove(batch);
+        mBatchId--;
         BluetoothOppBatch nextBatch;
         if (mBatchs.size() > 0) {
             for (int i = 0; i < mBatchs.size(); i++) {
-                // we have a running batch
                 nextBatch = mBatchs.get(i);
-                if (nextBatch.mStatus == Constants.BATCH_STATUS_RUNNING) {
-                    return;
-                } else {
+                if (V) Log.v(TAG, "Batch Status= " + nextBatch.mStatus);
+                if (nextBatch.mStatus == Constants.BATCH_STATUS_PENDING) {
                     // just finish a transfer, start pending outbound transfer
-                    if (nextBatch.mDirection == BluetoothShare.DIRECTION_OUTBOUND) {
+                    if (nextBatch.mDirection == BluetoothShare.DIRECTION_OUTBOUND
+                            && mTransfer == null) {
                         if (V) Log.v(TAG, "Start pending outbound batch " + nextBatch.mId);
                         mTransfer = new BluetoothOppTransfer(this, mPowerManager, nextBatch);
                         mTransfer.start();
@@ -868,9 +1008,10 @@ public class BluetoothOppService extends Service {
                         mServerTransfer = new BluetoothOppTransfer(this, mPowerManager, nextBatch,
                                                                    mServerSession);
                         mServerTransfer.start();
-                        if (nextBatch.getPendingShare().mConfirm ==
-                                BluetoothShare.USER_CONFIRMATION_CONFIRMED) {
-                            mServerTransfer.setConfirmed();
+                        BluetoothOppShareInfo mPendingShare = nextBatch.getPendingShare();
+                        if ((mPendingShare != null) && (mPendingShare.mConfirm ==
+                                BluetoothShare.USER_CONFIRMATION_CONFIRMED)) {
+                            mServerTransfer.confirmStatusChanged();
                         }
                         return;
                     }
@@ -934,14 +1075,94 @@ public class BluetoothOppService extends Service {
                 WHERE_INVISIBLE_COMPLETE_INBOUND_FAILED, null);
         if (V) Log.v(TAG, "Deleted complete inbound failed shares, number = " + delNum);
 
+        ContentValues updateValues;
+        // Update interrupted outbound share status
+        final String WHERE_OUTBOUND_INTERRUPTED_ON_POWER_OFF = BluetoothShare.DIRECTION + "="
+                + BluetoothShare.DIRECTION_OUTBOUND + " AND " + BluetoothShare.STATUS + "="
+                + BluetoothShare.STATUS_PENDING + " OR " + BluetoothShare.STATUS + "="
+                + BluetoothShare.STATUS_RUNNING;
+
+        Cursor cursorToUpdate = contentResolver.query(BluetoothShare.CONTENT_URI, null,
+                    WHERE_OUTBOUND_INTERRUPTED_ON_POWER_OFF, null, null);
+        if (cursorToUpdate != null) {
+            for (cursorToUpdate.moveToFirst(); !cursorToUpdate.isAfterLast();
+                    cursorToUpdate.moveToNext()) {
+                updateValues = new ContentValues();
+                updateValues.put(BluetoothShare.STATUS, BluetoothShare.STATUS_UNKNOWN_ERROR);
+                int mId = cursorToUpdate.getInt(cursorToUpdate.getColumnIndexOrThrow(
+                                    BluetoothShare._ID));
+                Uri contentUri = Uri.parse(BluetoothShare.CONTENT_URI + "/" + mId);
+                contentResolver.update(contentUri, updateValues, null, null);
+            }
+            if (V) Log.v(TAG, "Update interrupted outbound share status, number = "
+                        + cursorToUpdate.getCount());
+            cursorToUpdate.close();
+            cursorToUpdate = null;
+        }
+
+        // Update unconfirmed interrupted inbound shares status
+        final String WHERE_CONFIRMATION_PENDING_INBOUND = BluetoothShare.DIRECTION + "="
+                + BluetoothShare.DIRECTION_INBOUND + " AND " + BluetoothShare.USER_CONFIRMATION
+                + "=" + BluetoothShare.USER_CONFIRMATION_PENDING;
+
+        cursorToUpdate = contentResolver.query(BluetoothShare.CONTENT_URI, null,
+                    WHERE_CONFIRMATION_PENDING_INBOUND, null, null);
+
+        if (cursorToUpdate != null) {
+            if (cursorToUpdate.moveToFirst()) {
+                updateValues = new ContentValues();
+                updateValues.put(BluetoothShare.USER_CONFIRMATION,
+                        BluetoothShare.USER_CONFIRMATION_DENIED);
+                updateValues.put(BluetoothShare.STATUS, BluetoothShare.STATUS_UNKNOWN_ERROR);
+                int mId = cursorToUpdate.getInt(cursorToUpdate.getColumnIndexOrThrow(
+                                    BluetoothShare._ID));
+                Uri contentUri = Uri.parse(BluetoothShare.CONTENT_URI + "/" + mId);
+                contentResolver.update(contentUri, updateValues, null, null);
+            }
+            if (V) Log.v(TAG, "Update interrupted inbound share status, number = "
+                        + cursorToUpdate.getCount());
+            cursorToUpdate.close();
+            cursorToUpdate = null;
+        }
+
+        final String WHERE_INBOUND_INTERRUPTED_ON_POWER_OFF = BluetoothShare.DIRECTION + "="
+                + BluetoothShare.DIRECTION_INBOUND + " AND " + BluetoothShare.STATUS + "="
+                + BluetoothShare.STATUS_RUNNING;
+
+        Cursor cursorToFile = contentResolver.query(BluetoothShare.CONTENT_URI,
+                                  new String[] { BluetoothShare._DATA },
+                                  WHERE_INBOUND_INTERRUPTED_ON_POWER_OFF, null, null);
+
+        // remove the share and the respective file which was interrupted by battery
+        // removal in the local device
+        if (cursorToFile != null) {
+            if (cursorToFile.moveToFirst()) {
+                String fileName = cursorToFile.getString(0);
+                Log.v(TAG, "File to be deleted: " + fileName);
+                File fileToDelete = new File(fileName);
+                if (fileToDelete != null) fileToDelete.delete();
+                delNum = contentResolver.delete(BluetoothShare.CONTENT_URI,
+                             WHERE_INBOUND_INTERRUPTED_ON_POWER_OFF, null);
+                if (V) Log.v(TAG, "Delete aborted inbound share, number = " + delNum);
+            }
+            cursorToFile.close();
+            cursorToFile = null;
+        }
+
         // Only keep the inbound and successful shares for LiverFolder use
         // Keep the latest 1000 to easy db query
         final String WHERE_INBOUND_SUCCESS = BluetoothShare.DIRECTION + "="
                 + BluetoothShare.DIRECTION_INBOUND + " AND " + BluetoothShare.STATUS + "="
                 + BluetoothShare.STATUS_SUCCESS + " AND " + INVISIBLE;
-        Cursor cursor = contentResolver.query(BluetoothShare.CONTENT_URI, new String[] {
-            BluetoothShare._ID
-        }, WHERE_INBOUND_SUCCESS, null, BluetoothShare._ID); // sort by id
+        Cursor cursor;
+        try {
+            cursor = contentResolver.query(BluetoothShare.CONTENT_URI, new String[] {
+                        BluetoothShare._ID
+                    }, WHERE_INBOUND_SUCCESS, null, BluetoothShare._ID); // sort by id
+        } catch (SQLiteException e) {
+            cursor = null;
+            Log.e(TAG, "SQLite exception: " + e);
+        }
 
         if (cursor == null) {
             return;
@@ -952,7 +1173,15 @@ public class BluetoothOppService extends Service {
             int numToDelete = recordNum - Constants.MAX_RECORDS_IN_DATABASE;
 
             if (cursor.moveToPosition(numToDelete)) {
-                int columnId = cursor.getColumnIndexOrThrow(BluetoothShare._ID);
+                int columnId;
+                try {
+                    columnId = cursor.getColumnIndexOrThrow(BluetoothShare._ID);
+                } catch (IllegalArgumentException e) {
+                    cursor.close();
+                    cursor = null;
+                    Log.e(TAG, "Invalid share ID");
+                    return;
+                }
                 long id = cursor.getLong(columnId);
                 delNum = contentResolver.delete(BluetoothShare.CONTENT_URI,
                         BluetoothShare._ID + " < " + id, null);
@@ -960,6 +1189,7 @@ public class BluetoothOppService extends Service {
             }
         }
         cursor.close();
+        cursor = null;
     }
 
     private static class MediaScannerNotifier implements MediaScannerConnectionClient {

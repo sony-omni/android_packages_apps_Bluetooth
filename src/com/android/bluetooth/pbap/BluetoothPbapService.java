@@ -64,10 +64,11 @@ import com.android.bluetooth.btservice.AdapterService;
 
 import java.io.IOException;
 
-import javax.obex.ServerSession;
+import javax.btobex.ServerSession;
 
 public class BluetoothPbapService extends Service {
     private static final String TAG = "BluetoothPbapService";
+    public static final String LOG_TAG = "BluetoothPbap";
 
     /**
      * To enable PBAP DEBUG/VERBOSE logging - run below cmd in adb shell, and
@@ -78,7 +79,7 @@ public class BluetoothPbapService extends Service {
 
     public static final boolean DEBUG = true;
 
-    public static final boolean VERBOSE = false;
+    public static boolean VERBOSE;
 
     /**
      * Intent indicating incoming obex authentication request which is from
@@ -176,6 +177,9 @@ public class BluetoothPbapService extends Service {
     private int mState;
 
     private int mStartId = -1;
+
+    // PBAP Client has sent pbap connection request
+    private final static int PBAP_CONNECT_RECEIVED = 3;
 
     //private IBluetooth mBluetoothService;
 
@@ -289,15 +293,18 @@ public class BluetoothPbapService extends Service {
             mIsWaitingAuthorization = false;
 
             if (intent.getIntExtra(BluetoothDevice.EXTRA_CONNECTION_ACCESS_RESULT,
-                                   BluetoothDevice.CONNECTION_ACCESS_NO)
-                    == BluetoothDevice.CONNECTION_ACCESS_YES) {
+                                   BluetoothDevice.CONNECTION_ACCESS_NO) ==
+                BluetoothDevice.CONNECTION_ACCESS_YES) {
+
                 if (intent.getBooleanExtra(BluetoothDevice.EXTRA_ALWAYS_ALLOWED, false)) {
                     boolean result = mRemoteDevice.setPhonebookAccessPermission(
-                            BluetoothDevice.ACCESS_ALLOWED);
+                            PBAP_CONNECT_RECEIVED);
                     if (VERBOSE) {
-                        Log.v(TAG, "setPhonebookAccessPermission(ACCESS_ALLOWED) result=" + result);
+                        Log.v(TAG, "setPhonebookAccessPermission(PBAP_CONNECT_RECEIVED) result="
+                                + result);
                     }
                 }
+
                 try {
                     if (mConnSocket != null) {
                         startObexServerSession();
@@ -351,6 +358,7 @@ public class BluetoothPbapService extends Service {
     }
 
     private void startRfcommSocketListener() {
+        VERBOSE = Log.isLoggable(LOG_TAG, Log.VERBOSE) ? true : false;
         if (VERBOSE) Log.v(TAG, "Pbap Service startRfcommSocketListener");
 
         if (mAcceptThread == null) {
@@ -609,12 +617,15 @@ public class BluetoothPbapService extends Service {
                     int permission = mRemoteDevice.getPhonebookAccessPermission();
                     if (VERBOSE) Log.v(TAG, "getPhonebookAccessPermission() = " + permission);
 
-                    if (permission == BluetoothDevice.ACCESS_ALLOWED) {
+                    if (permission == BluetoothDevice.ACCESS_ALLOWED ||
+                        permission == PBAP_CONNECT_RECEIVED) {
                         try {
                             if (VERBOSE) {
                                 Log.v(TAG, "incoming connection accepted from: " + sRemoteDeviceName
                                         + " automatically as already allowed device");
                             }
+                            // update permission access request
+                            mRemoteDevice.setPhonebookAccessPermission(PBAP_CONNECT_RECEIVED);
                             startObexServerSession();
                         } catch (IOException ex) {
                             Log.e(TAG, "Caught exception starting obex server session"
@@ -751,8 +762,8 @@ public class BluetoothPbapService extends Service {
             int prevState = mState;
             mState = state;
             Intent intent = new Intent(BluetoothPbap.PBAP_STATE_CHANGED_ACTION);
-            intent.putExtra(BluetoothPbap.PBAP_PREVIOUS_STATE, prevState);
-            intent.putExtra(BluetoothPbap.PBAP_STATE, mState);
+            intent.putExtra(BluetoothProfile.EXTRA_PREVIOUS_STATE, prevState);
+            intent.putExtra(BluetoothProfile.EXTRA_STATE, mState);
             intent.putExtra(BluetoothDevice.EXTRA_DEVICE, mRemoteDevice);
             sendBroadcast(intent, BLUETOOTH_PERM);
             AdapterService s = AdapterService.getAdapterService();

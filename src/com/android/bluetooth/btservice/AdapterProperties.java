@@ -21,6 +21,8 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.BroadcastReceiver;
 import android.os.ParcelUuid;
 import android.os.UserHandle;
 import android.util.Log;
@@ -65,15 +67,55 @@ class AdapterProperties {
     private int mNumOfOffloadedScanFilterSupported;
     private int mOffloadedScanResultStorageBytes;
     private boolean mIsActivityAndEnergyReporting;
+    private Context mContext;
 
     // Lock for all getters and setters.
     // If finer grained locking is needer, more locks
     // can be added here.
     private Object mObject = new Object();
 
+    private class DeviceState {
+        private BluetoothDevice device = null;
+        private int currentState = 0;
+        private int profileId = 0;
+
+        public DeviceState(BluetoothDevice device, int profile,
+                int state) {
+            this.device = device;
+            this.profileId = profile;
+            this.currentState = state;
+        }
+        @Override
+        public boolean equals(Object o) {
+            if (o instanceof DeviceState) {
+                if (this.device.equals(((DeviceState) o).device) &&
+                        this.profileId == ((DeviceState) o).profileId &&
+                        this.currentState == ((DeviceState) o).currentState) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    private ArrayList<DeviceState> mConnectedDeviceList =
+                new ArrayList<DeviceState>();
+
+    private final BroadcastReceiver mBluetoothReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (Intent.ACTION_USER_SWITCHED.equals(action)) {
+                debugLog("USER_SWITCHED");
+                setScanMode(AbstractionLayer.BT_SCAN_MODE_NONE);
+            }
+        }
+    };
+
     public AdapterProperties(AdapterService service) {
         mService = service;
         mAdapter = BluetoothAdapter.getDefaultAdapter();
+        mContext = mService;
     }
     public void init(RemoteDevices remoteDevices) {
         if (mProfileConnectionState ==null) {
@@ -82,6 +124,12 @@ class AdapterProperties {
             mProfileConnectionState.clear();
         }
         mRemoteDevices = remoteDevices;
+        try {
+            IntentFilter filter = new IntentFilter(Intent.ACTION_USER_SWITCHED);
+            mContext.registerReceiver(mBluetoothReceiver, filter, null, null);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Exception: registerReceiver");
+        }
     }
 
     public void cleanup() {
@@ -93,6 +141,14 @@ class AdapterProperties {
         mService = null;
         if (!mBondedDevices.isEmpty())
             mBondedDevices.clear();
+        if (!mConnectedDeviceList.isEmpty())
+            mConnectedDeviceList.clear();
+        try {
+            mContext.unregisterReceiver(mBluetoothReceiver);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Exception: unregisterReceiver");
+        }
+        mContext = null;
     }
 
     @Override
@@ -302,6 +358,12 @@ class AdapterProperties {
                     debugLog("Removing bonded device:" +  device);
                 else
                     debugLog("Failed to remove device: " + device);
+            } else if (state == BluetoothDevice.BOND_BONDING) {
+                // Setting remote trust to false on BONDING state if it's already in BONDED list
+                if (mBondedDevices.contains(device)) {
+                    boolean result = mService.setRemoteTrust(device, false);
+                    debugLog("onBondStateChanged result=" + result);
+                }
             }
         }
         catch(Exception ee) {
@@ -338,6 +400,26 @@ class AdapterProperties {
     }
 
     void sendConnectionStateChange(BluetoothDevice device, int profile, int state, int prevState) {
+        // add device in connection list for first connected
+        // and remove it in disconnected
+        if (state == BluetoothProfile.STATE_CONNECTED) {
+            DeviceState newDevice = new DeviceState(device, profile, state);
+            if (!mConnectedDeviceList.contains(newDevice)) {
+                mConnectedDeviceList.add(newDevice);
+                Log.v(TAG,"device is added to list");
+            } else {
+                Log.v(TAG,"Fake broadcast for device, ignore");
+                return;
+            }
+        } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
+            DeviceState deviceState = new DeviceState(device, profile,
+                    BluetoothProfile.STATE_CONNECTED);
+            if(mConnectedDeviceList.contains(deviceState)) {
+                Log.v(TAG,"device is removed from list");
+                mConnectedDeviceList.remove(deviceState);
+            }
+        }
+
         if (!validateProfileConnectionState(state) ||
                 !validateProfileConnectionState(prevState)) {
             // Previously, an invalid state was broadcast anyway,
@@ -396,15 +478,24 @@ class AdapterProperties {
     private boolean updateCountersAndCheckForConnectionStateChange(int state, int prevState) {
         switch (prevState) {
             case BluetoothProfile.STATE_CONNECTING:
-                mProfilesConnecting--;
+                if (mProfilesConnecting > 0)
+                    mProfilesConnecting--;
+                else
+                    Log.e(TAG, "mProfilesConnecting " + mProfilesConnecting);
                 break;
 
             case BluetoothProfile.STATE_CONNECTED:
-                mProfilesConnected--;
+                if (mProfilesConnected > 0)
+                    mProfilesConnected--;
+                else
+                    Log.e(TAG, "mProfilesConnected " + mProfilesConnected);
                 break;
 
             case BluetoothProfile.STATE_DISCONNECTING:
-                mProfilesDisconnecting--;
+                if (mProfilesDisconnecting > 0)
+                    mProfilesDisconnecting--;
+                else
+                    Log.e(TAG, "mProfilesDisconnecting " + mProfilesDisconnecting);
                 break;
         }
 
@@ -579,15 +670,22 @@ class AdapterProperties {
         // When BT is being turned on, all adapter properties will be sent in 1
         // callback. At this stage, set the scan mode.
         synchronized (mObject) {
-            if (getState() == BluetoothAdapter.STATE_TURNING_ON &&
-                    mScanMode == BluetoothAdapter.SCAN_MODE_NONE) {
+            if (getState() == BluetoothAdapter.STATE_TURNING_ON) {
                     /* mDiscoverableTimeout is part of the
                        adapterPropertyChangedCallback received before
                        onBluetoothReady */
-                    if (mDiscoverableTimeout != 0)
-                      setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE);
-                    else /* if timeout == never (0) at startup */
-                      setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+                    switch (mScanMode) {
+                        case BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE:
+                            if (mDiscoverableTimeout != 0)
+                                setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE);
+                            else
+                                setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+                            break;
+                        case BluetoothAdapter.SCAN_MODE_NONE:
+                        case BluetoothAdapter.SCAN_MODE_CONNECTABLE:
+                        default:
+                            setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE);
+                    }
                     /* though not always required, this keeps NV up-to date on first-boot after flash */
                     setDiscoverableTimeout(mDiscoverableTimeout);
             }
@@ -604,19 +702,31 @@ class AdapterProperties {
         //continue with disable sequence
         debugLog("onBluetoothDisable()");
         mBluetoothDisabling = true;
+
         if (getState() == BluetoothAdapter.STATE_TURNING_OFF) {
-            setScanMode(AbstractionLayer.BT_SCAN_MODE_NONE);
+           switch (mScanMode) {
+               case BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE:
+                   if (mDiscoverableTimeout != 0)
+                       setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE);
+                   else
+                       setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+                   break;
+               case BluetoothAdapter.SCAN_MODE_NONE:
+               case BluetoothAdapter.SCAN_MODE_CONNECTABLE:
+               default:
+                   setScanMode(AbstractionLayer.BT_SCAN_MODE_CONNECTABLE);
+           }
         }
     }
     void discoveryStateChangeCallback(int state) {
-        infoLog("Callback:discoveryStateChangeCallback with state:" + state);
+        infoLog("Callback:discoveryStateChangeCallback with state:" + state + " disc: " + mDiscovering);
         synchronized (mObject) {
             Intent intent;
             if (state == AbstractionLayer.BT_DISCOVERY_STOPPED) {
                 mDiscovering = false;
                 intent = new Intent(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
                 mService.sendBroadcast(intent, mService.BLUETOOTH_PERM);
-            } else if (state == AbstractionLayer.BT_DISCOVERY_STARTED) {
+            } else if ((state == AbstractionLayer.BT_DISCOVERY_STARTED) && !mDiscovering) {
                 mDiscovering = true;
                 intent = new Intent(BluetoothAdapter.ACTION_DISCOVERY_STARTED);
                 mService.sendBroadcast(intent, mService.BLUETOOTH_PERM);
