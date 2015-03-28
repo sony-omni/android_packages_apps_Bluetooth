@@ -29,8 +29,9 @@ namespace android {
 static jmethodID method_onConnectionStateChanged;
 static jmethodID method_onAudioStateChanged;
 static jmethodID method_onAudioConfigChanged;
+static jmethodID method_onAudioFocusRequest;
 
-static const btav_interface_t *sBluetoothA2dpInterface = NULL;
+static const btav_sink_interface_t *sBluetoothA2dpInterface = NULL;
 static jobject mCallbacksObj = NULL;
 static JNIEnv *sCallbackEnv = NULL;
 
@@ -116,11 +117,34 @@ static void bta2dp_audio_config_callback(bt_bdaddr_t *bd_addr, uint32_t sample_r
     sCallbackEnv->DeleteLocalRef(addr);
 }
 
+static void bta2dp_audio_focus_request_callback(int enable, bt_bdaddr_t* bd_addr) {
+    jbyteArray addr;
+
+    ALOGI("%s", __FUNCTION__);
+
+    if (!checkCallbackThread()) {                                       \
+        ALOGE("Callback: '%s' is not called on the correct thread", __FUNCTION__); \
+        return;                                                         \
+    }
+    addr = sCallbackEnv->NewByteArray(sizeof(bt_bdaddr_t));
+    if (!addr) {
+        ALOGE("Fail to new jbyteArray bd addr for connection state");
+        checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+        return;
+    }
+
+    sCallbackEnv->SetByteArrayRegion(addr, 0, sizeof(bt_bdaddr_t), (jbyte*) bd_addr);
+    sCallbackEnv->CallVoidMethod(mCallbacksObj, method_onAudioFocusRequest, (jint) enable, addr);
+    checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+    sCallbackEnv->DeleteLocalRef(addr);
+}
 static btav_callbacks_t sBluetoothA2dpCallbacks = {
     sizeof(sBluetoothA2dpCallbacks),
     bta2dp_connection_state_callback,
     bta2dp_audio_state_callback,
-    bta2dp_audio_config_callback
+    bta2dp_audio_config_callback,
+    NULL,
+    bta2dp_audio_focus_request_callback
 };
 
 static void classInitNative(JNIEnv* env, jclass clazz) {
@@ -136,6 +160,9 @@ static void classInitNative(JNIEnv* env, jclass clazz) {
 
     method_onAudioConfigChanged =
         env->GetMethodID(clazz, "onAudioConfigChanged", "([BII)V");
+
+    method_onAudioFocusRequest =
+        env->GetMethodID(clazz, "onAudioFocusRequest", "(I[B)V");
 
     ALOGI("%s: succeeds", __FUNCTION__);
 }
@@ -161,7 +188,7 @@ static void initNative(JNIEnv *env, jobject object) {
          mCallbacksObj = NULL;
     }
 
-    if ( (sBluetoothA2dpInterface = (btav_interface_t *)
+    if ( (sBluetoothA2dpInterface = (btav_sink_interface_t *)
           btInf->get_profile_interface(BT_PROFILE_ADVANCED_AUDIO_SINK_ID)) == NULL) {
         ALOGE("Failed to get Bluetooth A2DP Sink Interface");
         return;
@@ -237,12 +264,43 @@ static jboolean disconnectA2dpNative(JNIEnv *env, jobject object, jbyteArray add
     return (status == BT_STATUS_SUCCESS) ? JNI_TRUE : JNI_FALSE;
 }
 
+static void informAudioFocusStateNative(JNIEnv *env, jobject object, int state) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+    sBluetoothA2dpInterface->audio_focus_status(state);
+}
+
+static void suspendA2dpNative(JNIEnv *env, jobject object) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+
+    sBluetoothA2dpInterface->suspend_sink();
+}
+
+static void resumeA2dpNative(JNIEnv *env, jobject object) {
+
+    if (!sBluetoothA2dpInterface) {
+        ALOGE("sBluetoothA2dpInterface is NULL ");
+        return;
+    }
+
+    sBluetoothA2dpInterface->resume_sink();
+}
 static JNINativeMethod sMethods[] = {
     {"classInitNative", "()V", (void *) classInitNative},
     {"initNative", "()V", (void *) initNative},
     {"cleanupNative", "()V", (void *) cleanupNative},
     {"connectA2dpNative", "([B)Z", (void *) connectA2dpNative},
     {"disconnectA2dpNative", "([B)Z", (void *) disconnectA2dpNative},
+    {"suspendA2dpNative", "()V", (void *) suspendA2dpNative},
+    {"resumeA2dpNative", "()V", (void *) resumeA2dpNative},
+    {"informAudioFocusStateNative", "(I)V", (void *) informAudioFocusStateNative},
 };
 
 int register_com_android_bluetooth_a2dp_sink(JNIEnv* env)

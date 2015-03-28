@@ -46,6 +46,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteException;
 import android.util.Log;
 
 import java.io.File;
@@ -60,7 +61,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class BluetoothOppUtility {
     private static final String TAG = "BluetoothOppUtility";
     private static final boolean D = Constants.DEBUG;
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     private static final ConcurrentHashMap<Uri, BluetoothOppSendFileInfo> sSendFileMap
             = new ConcurrentHashMap<Uri, BluetoothOppSendFileInfo>();
@@ -68,52 +69,70 @@ public class BluetoothOppUtility {
     public static BluetoothOppTransferInfo queryRecord(Context context, Uri uri) {
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         BluetoothOppTransferInfo info = new BluetoothOppTransferInfo();
-        Cursor cursor = context.getContentResolver().query(uri, null, null, null, null);
+        Cursor cursor;
+        try {
+            cursor = context.getContentResolver().query(uri, null, null, null, null);
+        } catch (SQLiteException e) {
+            cursor = null;
+            Log.e(TAG, "SQLite exception: " + e);
+        }
+
         if (cursor != null) {
             if (cursor.moveToFirst()) {
-                info.mID = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare._ID));
-                info.mStatus = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.STATUS));
-                info.mDirection = cursor.getInt(cursor
-                        .getColumnIndexOrThrow(BluetoothShare.DIRECTION));
-                info.mTotalBytes = cursor.getInt(cursor
-                        .getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES));
-                info.mCurrentBytes = cursor.getInt(cursor
-                        .getColumnIndexOrThrow(BluetoothShare.CURRENT_BYTES));
-                info.mTimeStamp = cursor.getLong(cursor
-                        .getColumnIndexOrThrow(BluetoothShare.TIMESTAMP));
-                info.mDestAddr = cursor.getString(cursor
-                        .getColumnIndexOrThrow(BluetoothShare.DESTINATION));
+                int confirmationType;
+                try {
+                    info.mID = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare._ID));
+                    info.mStatus = cursor.getInt(cursor.getColumnIndexOrThrow(BluetoothShare.STATUS));
+                    info.mDirection = cursor.getInt(cursor
+                            .getColumnIndexOrThrow(BluetoothShare.DIRECTION));
+                    info.mTotalBytes = cursor.getLong(cursor
+                            .getColumnIndexOrThrow(BluetoothShare.TOTAL_BYTES));
+                    info.mCurrentBytes = cursor.getLong(cursor
+                            .getColumnIndexOrThrow(BluetoothShare.CURRENT_BYTES));
+                    info.mTimeStamp = cursor.getLong(cursor
+                            .getColumnIndexOrThrow(BluetoothShare.TIMESTAMP));
+                    info.mDestAddr = cursor.getString(cursor
+                            .getColumnIndexOrThrow(BluetoothShare.DESTINATION));
 
-                info.mFileName = cursor.getString(cursor
-                        .getColumnIndexOrThrow(BluetoothShare._DATA));
-                if (info.mFileName == null) {
                     info.mFileName = cursor.getString(cursor
-                            .getColumnIndexOrThrow(BluetoothShare.FILENAME_HINT));
-                }
-                if (info.mFileName == null) {
-                    info.mFileName = context.getString(R.string.unknown_file);
-                }
+                            .getColumnIndexOrThrow(BluetoothShare._DATA));
+                    if (info.mFileName == null) {
+                        info.mFileName = cursor.getString(cursor
+                                .getColumnIndexOrThrow(BluetoothShare.FILENAME_HINT));
+                    }
+                    if (info.mFileName == null) {
+                        info.mFileName = context.getString(R.string.unknown_file);
+                    }
 
-                info.mFileUri = cursor.getString(cursor.getColumnIndexOrThrow(BluetoothShare.URI));
+                    info.mFileUri = cursor.getString(cursor.getColumnIndexOrThrow(BluetoothShare.URI));
 
-                if (info.mFileUri != null) {
-                    Uri u = originalUri(Uri.parse(info.mFileUri));
-                    info.mFileType = context.getContentResolver().getType(u);
-                } else {
-                    Uri u = Uri.parse(info.mFileName);
-                    info.mFileType = context.getContentResolver().getType(u);
-                }
-                if (info.mFileType == null) {
-                    info.mFileType = cursor.getString(cursor
-                            .getColumnIndexOrThrow(BluetoothShare.MIMETYPE));
+                    if (info.mFileUri != null) {
+                        Uri u = originalUri(Uri.parse(info.mFileUri));
+                        info.mFileType = context.getContentResolver().getType(u);
+                    } else {
+                        Uri u = Uri.parse(info.mFileName);
+                        info.mFileType = context.getContentResolver().getType(u);
+                    }
+
+                    if (info.mFileType == null) {
+                        info.mFileType = cursor.getString(cursor
+                                .getColumnIndexOrThrow(BluetoothShare.MIMETYPE));
+                    }
+
+                    confirmationType = cursor.getInt(
+                        cursor.getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION));
+
+                } catch (IllegalArgumentException e) {
+                    cursor.close();
+                    cursor = null;
+                    Log.e(TAG, "Invalid share info");
+                    return null;
                 }
 
                 BluetoothDevice remoteDevice = adapter.getRemoteDevice(info.mDestAddr);
                 info.mDeviceName =
                         BluetoothOppManager.getInstance(context).getDeviceName(remoteDevice);
 
-                int confirmationType = cursor.getInt(
-                        cursor.getColumnIndexOrThrow(BluetoothShare.USER_CONFIRMATION));
                 info.mHandoverInitiated =
                         confirmationType == BluetoothShare.USER_CONFIRMATION_HANDOVER_CONFIRMED;
 
@@ -121,6 +140,7 @@ public class BluetoothOppUtility {
                             + info.mDestAddr);
             }
             cursor.close();
+            cursor = null;
         } else {
             info = null;
             if (V) Log.v(TAG, "BluetoothOppManager Error: not got data from db for uri:" + uri);
@@ -136,10 +156,16 @@ public class BluetoothOppUtility {
         ArrayList<String> uris = Lists.newArrayList();
         final String WHERE = BluetoothShare.TIMESTAMP + " == " + timeStamp;
 
-        Cursor metadataCursor = context.getContentResolver().query(BluetoothShare.CONTENT_URI,
-                new String[] {
-                    BluetoothShare._DATA
-                }, WHERE, null, BluetoothShare._ID);
+        Cursor metadataCursor;
+        try {
+            metadataCursor = context.getContentResolver().query(BluetoothShare.CONTENT_URI,
+                    new String[] {
+                        BluetoothShare._DATA
+                    }, WHERE, null, BluetoothShare._ID);
+        } catch (SQLiteException e) {
+            metadataCursor = null;
+            Log.e(TAG, "SQLite exception: " + e);
+        }
 
         if (metadataCursor == null) {
             return null;
@@ -157,6 +183,7 @@ public class BluetoothOppUtility {
             if (V) Log.d(TAG, "Uri in this batch: " + path.toString());
         }
         metadataCursor.close();
+        metadataCursor = null;
         return uris;
     }
 

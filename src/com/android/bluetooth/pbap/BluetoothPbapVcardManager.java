@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013, The Linux Foundation. All rights reserved.
  * Copyright (c) 2008-2009, Motorola, Inc.
  * Copyright (C) 2009-2012, Broadcom Corporation
  *
@@ -48,7 +49,8 @@ import android.provider.ContactsContract.PhoneLookup;
 import android.telephony.PhoneNumberUtils;
 import android.text.TextUtils;
 import android.util.Log;
-
+import java.util.Collections;
+import java.util.Comparator;
 import com.android.bluetooth.R;
 import com.android.vcard.VCardComposer;
 import com.android.vcard.VCardConfig;
@@ -58,16 +60,16 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 
-import javax.obex.ServerOperation;
-import javax.obex.Operation;
-import javax.obex.ResponseCodes;
+import javax.btobex.ServerOperation;
+import javax.btobex.Operation;
+import javax.btobex.ResponseCodes;
 
 import com.android.bluetooth.Utils;
 
 public class BluetoothPbapVcardManager {
     private static final String TAG = "BluetoothPbapVcardManager";
 
-    private static final boolean V = BluetoothPbapService.VERBOSE;
+    private static final boolean V = Log.isLoggable(BluetoothPbapService.LOG_TAG, Log.VERBOSE) ? true : false;
 
     private ContentResolver mResolver;
 
@@ -81,8 +83,16 @@ public class BluetoothPbapVcardManager {
             Contacts.DISPLAY_NAME, // 4
     };
 
+    private final String SIM_URI = "content://icc/adn";
+
+    static final String[] SIM_PROJECTION = new String[] {
+            Contacts.DISPLAY_NAME,
+            CommonDataKinds.Phone.NUMBER,
+    };
     private static final int PHONE_NUMBER_COLUMN_INDEX = 3;
 
+    private static final int SIM_NAME_COLUMN_INDEX = 0;
+    private static final int SIM_NUMBER_COLUMN_INDEX = 1;
     static final String SORT_ORDER_PHONE_NUMBER = CommonDataKinds.Phone.NUMBER + " ASC";
 
     static final String[] CONTACTS_PROJECTION = new String[] {
@@ -100,7 +110,7 @@ public class BluetoothPbapVcardManager {
     // here.
     static final String CALLLOG_SORT_ORDER = Calls._ID + " DESC";
 
-    private static final String CLAUSE_ONLY_VISIBLE = Contacts.IN_VISIBLE_GROUP + "=1";
+    private static final String CLAUSE_ONLY_VISIBLE = null;
 
     public BluetoothPbapVcardManager(final Context context) {
         mContext = context;
@@ -152,6 +162,9 @@ public class BluetoothPbapVcardManager {
             case BluetoothPbapObexServer.ContentType.PHONEBOOK:
                 size = getContactsSize();
                 break;
+            case BluetoothPbapObexServer.ContentType.SIM_PHONEBOOK:
+                size = getSIMContactsSize();
+                break;
             default:
                 size = getCallHistorySize(type);
                 break;
@@ -175,6 +188,23 @@ public class BluetoothPbapVcardManager {
             if (contactCursor != null) {
                 contactCursor.close();
                 contactCursor = null;
+            }
+        }
+        return size;
+    }
+
+    public final int getSIMContactsSize() {
+        final Uri myUri = Uri.parse(SIM_URI);
+        int size = 0;
+        Cursor contactCursor = null;
+        try {
+            contactCursor = mResolver.query(myUri, SIM_PROJECTION, null,null, null);
+            if (contactCursor != null) {
+                size = contactCursor.getCount() +1;  //always has the 0.vcf
+            }
+        } finally {
+            if (contactCursor != null) {
+                contactCursor.close();
             }
         }
         return size;
@@ -244,6 +274,47 @@ public class BluetoothPbapVcardManager {
         }
         return list;
     }
+    public final ArrayList<String> getSIMPhonebookNameList(final int orderByWhat) {
+        ArrayList<String> nameList = new ArrayList<String>();
+        nameList.add(BluetoothPbapService.getLocalPhoneName());
+        //Since owner card should always be 0.vcf, maintaing a separate list to avoid sorting
+        ArrayList<String> allnames = new ArrayList<String>();
+        final Uri myUri = Uri.parse(SIM_URI);
+        Cursor contactCursor = null;
+        try {
+            contactCursor = mResolver.query(myUri, SIM_PROJECTION, null,null,null);
+            if (contactCursor != null) {
+                for (contactCursor.moveToFirst(); !contactCursor.isAfterLast(); contactCursor
+                        .moveToNext()) {
+                    String name = contactCursor.getString(SIM_NAME_COLUMN_INDEX);
+                    if (TextUtils.isEmpty(name)) {
+                        name = mContext.getString(android.R.string.unknownName);
+                    }
+                    allnames.add(name);
+                }
+            }
+        } finally {
+            if (contactCursor != null) {
+                contactCursor.close();
+            }
+        }
+        if (orderByWhat == BluetoothPbapObexServer.ORDER_BY_INDEXED) {
+                if (V) Log.v(TAG, "getPhonebookNameList, order by index");
+        } else if (orderByWhat == BluetoothPbapObexServer.ORDER_BY_ALPHABETICAL) {
+                if (V) Log.v(TAG, "getPhonebookNameList, order by alpha");
+                Collections.sort(allnames, new Comparator <String> ()
+                                 {@Override
+                                  public int compare(String str1, String str2){
+                                      return str1.compareToIgnoreCase(str2);
+                                  }
+                 });
+        }
+
+        nameList.addAll(allnames);
+        return nameList;
+
+    }
+
 
     public final ArrayList<String> getPhonebookNameList(final int orderByWhat) {
         ArrayList<String> nameList = new ArrayList<String>();
@@ -292,6 +363,75 @@ public class BluetoothPbapVcardManager {
         return nameList;
     }
 
+    public final ArrayList<String> getSIMContactNamesByNumber(final String phoneNumber) {
+        ArrayList<String> nameList = new ArrayList<String>();
+        ArrayList<String> startNameList = new ArrayList<String>();
+        StringBuilder onlyphoneNumber = new StringBuilder();
+        for (int j=0; j<phoneNumber.length(); j++) {
+            char c = phoneNumber.charAt(j);
+                if (c >= '0' && c <= '9') {
+                    onlyphoneNumber = onlyphoneNumber.append(c);
+                }
+        }
+        String SearchOnlyNumber = onlyphoneNumber.toString();
+
+        Cursor contactCursor = null;
+        final Uri uri = Uri.parse(SIM_URI);
+
+        try {
+            contactCursor = mResolver.query(uri, SIM_PROJECTION, null, null, null);
+
+            if (contactCursor != null) {
+                for (contactCursor.moveToFirst(); !contactCursor.isAfterLast(); contactCursor
+                        .moveToNext()) {
+                    String number = contactCursor.getString(SIM_NUMBER_COLUMN_INDEX);
+                    if (number == null) {
+                        if (V) Log.v(TAG, "number is null");
+                        continue;
+                    }
+                    StringBuilder onlyNumber = new StringBuilder();
+                    for (int j=0; j<number.length(); j++) {
+                        char c = number.charAt(j);
+                        if (c >= '0' && c <= '9') {
+                            onlyNumber = onlyNumber.append(c);
+                        }
+                    }
+                    String tmpNumber = onlyNumber.toString();
+                    if (V) Log.v(TAG, "number: "+number+" onlyNumber:"+onlyNumber+" tmpNumber:"+tmpNumber);
+                    if (tmpNumber.endsWith(SearchOnlyNumber)) {
+                        String name = contactCursor.getString(SIM_NAME_COLUMN_INDEX);
+                        if (TextUtils.isEmpty(name)) {
+                            name = mContext.getString(android.R.string.unknownName);
+                        }
+                        if (V) Log.v(TAG, "got name " + name + " by number " + phoneNumber);
+                        if (V) Log.v(TAG, "Adding to end name list");
+                        nameList.add(name);
+                    }
+                    if (tmpNumber.startsWith(SearchOnlyNumber)) {
+                        String name = contactCursor.getString(SIM_NAME_COLUMN_INDEX);
+                        if (TextUtils.isEmpty(name)) {
+                            name = mContext.getString(android.R.string.unknownName);
+                        }
+                        if (V) Log.v(TAG, "got name " + name + " by number " + phoneNumber);
+                        if (V) Log.v(TAG, "Adding to start name list");
+                        startNameList.add(name);
+                    }
+                }
+            }
+        } finally {
+            if (contactCursor != null) {
+                contactCursor.close();
+            }
+        }
+        int startListSize = startNameList.size();
+        for (int index = 0; index < startListSize; index++) {
+            String object = startNameList.get(index);
+            if (!nameList.contains(object))
+                nameList.add(object);
+        }
+
+        return nameList;
+    }
     public final ArrayList<String> getContactNamesByNumber(final String phoneNumber) {
         ArrayList<String> nameList = new ArrayList<String>();
         ArrayList<String> tempNameList = new ArrayList<String>();
@@ -443,16 +583,59 @@ public class BluetoothPbapVcardManager {
 
         final String selection;
         if (startPoint == endPoint) {
-            selection = Contacts._ID + "=" + startPointId + " AND " + CLAUSE_ONLY_VISIBLE;
+            selection = Contacts._ID + "=" + startPointId;
         } else {
             selection = Contacts._ID + ">=" + startPointId + " AND " + Contacts._ID + "<="
-                    + endPointId + " AND " + CLAUSE_ONLY_VISIBLE;
+                    + endPointId;
         }
 
         if (V) Log.v(TAG, "Query selection is: " + selection);
 
         return composeAndSendVCards(op, selection, vcardType21, ownerVCard, true,
             ignorefilter, filter);
+    }
+    public final int composeAndSendSIMPhonebookVcards(Operation op, final int startPoint,
+            final int endPoint, final boolean vcardType21, String ownerVCard) {
+        if (startPoint < 1 || startPoint > endPoint) {
+            Log.e(TAG, "internal error: startPoint or endPoint is not correct.");
+            return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+        }
+        final Uri myUri = Uri.parse(SIM_URI);
+        BluetoothPbapSIMvCardComposer composer = null;
+        HandlerForStringBuffer buffer = null;
+            try {
+                composer = new BluetoothPbapSIMvCardComposer(mContext);
+                buffer = new HandlerForStringBuffer(op, ownerVCard);
+
+                if (!composer.init(myUri, null, null, null)||
+                                   !buffer.onInit(mContext)) {
+                    return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+                }
+               composer.moveToPosition(startPoint -1, false);
+               for (int count =startPoint -1; count < endPoint; count++) {
+                   if (BluetoothPbapObexServer.sIsAborted) {
+                       ((ServerOperation)op).isAborted = true;
+                       BluetoothPbapObexServer.sIsAborted = false;
+                       break;
+                   }
+                   String vcard = composer.createOneEntry(vcardType21);
+                   if (vcard == null) {
+                       Log.e(TAG, "Failed to read a contact. Error reason: "
+                               + composer.getErrorReason());
+                       return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+                   }
+                   buffer.onEntryCreated(vcard);
+               }
+            } finally {
+                if (composer != null) {
+                    composer.terminate();
+                }
+                if (buffer != null) {
+                    buffer.onTerminate();
+                }
+            }
+
+        return ResponseCodes.OBEX_HTTP_OK;
     }
 
     public final int composeAndSendPhonebookOneVcard(Operation op, final int offset,
@@ -512,17 +695,67 @@ public class BluetoothPbapVcardManager {
             ignorefilter, filter);
     }
 
+    public final int composeAndSendSIMPhonebookOneVcard(Operation op, final int offset,
+        final boolean vcardType21, String ownerVCard, int orderByWhat) {
+        if (offset < 1) {
+            Log.e(TAG, "Internal error: offset is not correct.");
+            return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+        }
+        final Uri myUri = Uri.parse(SIM_URI);
+
+        BluetoothPbapSIMvCardComposer composer = null;
+        HandlerForStringBuffer buffer = null;
+            try {
+                composer = new BluetoothPbapSIMvCardComposer(mContext);
+                buffer = new HandlerForStringBuffer(op, ownerVCard);
+                if (!composer.init(myUri, null, null,null)||
+                                   !buffer.onInit(mContext)) {
+                    return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+                }
+                if (orderByWhat == BluetoothPbapObexServer.ORDER_BY_INDEXED) {
+                    if (V) Log.v(TAG, "getPhonebookNameList, order by index");
+                    composer.moveToPosition(offset -1, false);
+                } else if (orderByWhat == BluetoothPbapObexServer.ORDER_BY_ALPHABETICAL) {
+                    if (V) Log.v(TAG, "getPhonebookNameList, order by alpha");
+                    composer.moveToPosition(offset -1, true);
+                }
+                if (BluetoothPbapObexServer.sIsAborted) {
+                    ((ServerOperation)op).isAborted = true;
+                     BluetoothPbapObexServer.sIsAborted = false;
+                }
+                String vcard = composer.createOneEntry(vcardType21);
+                if (vcard == null) {
+                    Log.e(TAG, "Failed to read a contact. Error reason: "
+                                + composer.getErrorReason());
+                    return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+                }
+                buffer.onEntryCreated(vcard);
+            } finally {
+                if (composer != null) {
+                    composer.terminate();
+                }
+                if (buffer != null) {
+                    buffer.onTerminate();
+                }
+            }
+
+        return ResponseCodes.OBEX_HTTP_OK;
+    }
+
     public final int composeAndSendVCards(Operation op, final String selection,
             final boolean vcardType21, String ownerVCard, boolean isContacts,
             boolean ignorefilter, byte[] filter) {
         long timestamp = 0;
         if (V) timestamp = System.currentTimeMillis();
 
+        FilterVcard vcardfilter= new FilterVcard();
+        if (!ignorefilter) {
+            vcardfilter.setFilter(filter);
+        }
+        HandlerForStringBuffer buffer = null;
+
         if (isContacts) {
             VCardComposer composer = null;
-            VCardFilter vcardfilter= new VCardFilter(ignorefilter ? null : filter);
-
-            HandlerForStringBuffer buffer = null;
             try {
                 // Currently only support Generic Vcard 2.1 and 3.0
                 int vcardType;
@@ -573,11 +806,15 @@ public class BluetoothPbapVcardManager {
                         return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
                     }
                     if (V) Log.v (TAG , "vCard from composer: " + vcard);
-
-                    vcard = vcardfilter.apply(vcard, vcardType21);
+                    if (!ignorefilter) {
+                        vcard = vcardfilter.applyFilter(vcard, vcardType21);
+                        if (V) Log.v (TAG , "vCard on applying filter: " + vcard);
+                    }
                     vcard = StripTelephoneNumber(vcard);
-
-                    if (V) Log.v (TAG, "vCard after cleanup: " + vcard);
+                    if (V) {
+                        Log.v(TAG, "Vcard Entry:");
+                        Log.v(TAG,vcard);
+                    }
 
                     if (!buffer.onEntryCreated(vcard)) {
                         // onEntryCreate() already emits error.
@@ -594,7 +831,6 @@ public class BluetoothPbapVcardManager {
             }
         } else { // CallLog
             BluetoothPbapCallLogComposer composer = null;
-            HandlerForStringBuffer buffer = null;
             try {
 
                 composer = new BluetoothPbapCallLogComposer(mContext);
@@ -612,6 +848,13 @@ public class BluetoothPbapVcardManager {
                         break;
                     }
                     String vcard = composer.createOneEntry(vcardType21);
+                    Log.v (TAG , "vCard from composer: " + vcard);
+                    if (!ignorefilter) {
+                        if (vcard != null) {
+                            vcard = vcardfilter.applyFilter(vcard, vcardType21);
+                            Log.v (TAG , "vCard on applying filter: " + vcard);
+                        }
+                    }
                     if (vcard == null) {
                         Log.e(TAG, "Failed to read a contact. Error reason: "
                                 + composer.getErrorReason());
@@ -718,84 +961,311 @@ public class BluetoothPbapVcardManager {
         }
     }
 
-    public static class VCardFilter {
-        private static enum FilterBit {
-            //       bit  property    onlyCheckV21  excludeForV21
-            FN (       1, "FN",       true,         false),
-            PHOTO(     3, "PHOTO",    false,        false),
-            BDAY(      4, "BDAY",     false,        false),
-            ADR(       5, "ADR",      false,        false),
-            EMAIL(     8, "EMAIL",    false,        false),
-            TITLE(    12, "TITLE",    false,        false),
-            ORG(      16, "ORG",      false,        false),
-            NOTES(    17, "NOTES",    false,        false),
-            URL(      20, "URL",      false,        false),
-            NICKNAME( 23, "NICKNAME", false,        true);
+    public class FilterVcard{
 
-            public final int pos;
-            public final String prop;
-            public final boolean onlyCheckV21;
-            public final boolean excludeForV21;
+        public FilterVcard(){
+        };
 
-            FilterBit(int pos, String prop, boolean onlyCheckV21, boolean excludeForV21) {
-                this.pos = pos;
-                this.prop = prop;
-                this.onlyCheckV21 = onlyCheckV21;
-                this.excludeForV21 = excludeForV21;
+        private final int FN_BIT = 1;
+
+        private boolean fn = true;
+
+        private final int PHOTO_BIT = 3;
+
+        private boolean photo = true;
+
+        //BDAY falls under events
+        private final int BDAY_BIT = 4;
+
+        private boolean bday = true;
+
+        private final int ADR_BIT = 5;
+
+        private boolean adr = true;
+
+        private final int EMAIL_BIT = 8;
+
+        private boolean email = true;
+
+        private final int TITLE_BIT = 12;
+
+        private boolean title = true;
+
+        private final int ORG_BIT = 16;
+
+        private boolean org = true;
+
+        private final int NOTES_BIT = 17;
+
+        private boolean notes = true;
+
+        private final int URL_BIT = 20;
+
+        private boolean url = true;
+
+        private final int NICKNAME_BIT = 23;
+
+        private boolean nickname = true;
+
+        private final int DATETIME_BIT = 28;
+
+        private boolean datetime = true;
+
+        public void setFilter(byte[] filter){
+
+           fn = checkbit(FN_BIT, filter);
+           photo = checkbit(PHOTO_BIT, filter);
+           bday = checkbit(BDAY_BIT, filter);
+           adr = checkbit(ADR_BIT, filter);
+           email = checkbit(EMAIL_BIT, filter);
+           title = checkbit(TITLE_BIT, filter);
+           org = checkbit(ORG_BIT, filter);
+           notes = checkbit(NOTES_BIT, filter);
+           url = checkbit(URL_BIT, filter);
+           nickname = checkbit(NICKNAME_BIT, filter);
+           datetime = checkbit(DATETIME_BIT, filter);
+        }
+
+        private boolean checkbit (int attr_bit, byte[] filter){
+            int filterlen = filter.length;
+            if( ((filter[filterlen -1 -((int)attr_bit/8)] >> (attr_bit%8)) & 0x01) == 0) {
+                return false;
             }
+            return true;
         }
 
-        private static final String SEPARATOR = System.getProperty("line.separator");
-        private final byte[] filter;
-
-        private boolean isFilteredOut(FilterBit bit, boolean vCardType21) {
-            final int offset = (bit.pos / 8) + 1;
-            final int bit_pos = bit.pos % 8;
-            if (!vCardType21 && bit.onlyCheckV21) return false;
-            if (vCardType21 && bit.excludeForV21) return true;
-            if (filter == null || offset >= filter.length) return false;
-            return ((filter[filter.length - offset] >> bit_pos) & 0x01) != 0;
+        public boolean isPhotoEnabled(){
+            return photo;
         }
 
-        VCardFilter(byte[] filter) {
-            this.filter = filter;
+        private boolean checkValidFilter (String attr) {
+            if((attr.startsWith("N:")) || (attr.startsWith("TEL"))
+                || (attr.startsWith("VERSION")) || (attr.startsWith("URL"))
+                || (attr.startsWith("FN")) || (attr.startsWith("BDAY"))
+                || (attr.startsWith("ADR")) || (attr.startsWith("EMAIL"))
+                || (attr.startsWith("TITLE")) || (attr.startsWith("ORG"))
+                || (attr.startsWith("NOTE")) || (attr.startsWith("NICKNAME"))) {
+                return true;
+            }
+            return false;
         }
 
-        public boolean isPhotoEnabled() {
-            return !isFilteredOut(FilterBit.PHOTO, false);
-        }
+        public String applyFilter ( String vCard, boolean vCardType21){
+            String attr [] = vCard.split(System.getProperty("line.separator"));
+            String filteredVcard = "";
 
-        public String apply(String vCard, boolean vCardType21){
-            if (filter == null) return vCard;
-            String lines[] = vCard.split(SEPARATOR);
-            StringBuilder filteredVCard = new StringBuilder();
-            boolean filteredOut = false;
-
-            for (String line : lines) {
-                // Check whether the current property is changing (ignoring multi-line properties)
-                // and determine if the current property is filtered in.
-                if (!Character.isWhitespace(line.charAt(0)) && !line.startsWith("=")) {
-                    String currentProp = line.split("[;:]")[0];
-                    filteredOut = false;
-
-                    for (FilterBit bit : FilterBit.values()) {
-                        if (bit.prop.equals(currentProp)) {
-                            filteredOut = isFilteredOut(bit, vCardType21);
-                            break;
+            //FN is not the mandatory field in 2.1 vCard
+            if(((!fn) && (vCardType21)) && (vCard.contains("FN"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("FN")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
                         }
                     }
-
-                    // Since PBAP does not have filter bits for IM and SIP,
-                    // exclude them by default. Easiest way is to exclude all
-                    // X- fields....
-                    if (currentProp.startsWith("X-")) filteredOut = true;
                 }
-
-                // Build filtered vCard
-                if (!filteredOut) filteredVCard.append(line + SEPARATOR);
             }
 
-            return filteredVCard.toString();
+          //NOTE: No need to check photo, we already refrained it if it is not set in the filter
+            if((!bday) && (vCard.contains("BDAY"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("BDAY")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!adr) && (vCard.contains("ADR"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("ADR")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!email) && (vCard.contains("EMAIL"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("EMAIL")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!title) && (vCard.contains("TITLE"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("TITLE")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!org) && (vCard.contains("ORG"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("ORG")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!notes) && (vCard.contains("NOTE"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("NOTE")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+            /*Nickname is not supported in 2.1 version.
+             *Android still ads it for 2.1 with nickname mentioned in lower case, and therefore
+             *we need to check for both cases.
+             */
+            if(((!nickname) || (vCardType21)) && (vCard.contains("NICKNAME"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("NICKNAME")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!url) && (vCard.contains("URL"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("URL")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((!datetime) && (vCard.contains("X-IRMC-CALL-DATETIME"))) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].startsWith("X-IRMC-CALL-DATETIME")){
+                        attr[i] = "";
+                        /** Remove multiline Content, if any */
+                        /** End traversal before END:VCARD */
+                        for (int j = i+1; j < attr.length - 1; j++) {
+                            if (checkValidFilter(attr[j])) {
+                                break;
+                            } else {
+                                /** Continuation of above attribute, remove */
+                                attr[j] = "";
+                            }
+                        }
+                    }
+                }
+            }
+            /*Since PBAP does not have filter bit for IM and SIP,
+             *removing them by default.
+            */
+            if(vCard.toUpperCase().contains("IM")) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].toUpperCase().contains("IM")){
+                        vCard = vCard.replace(attr[i] + "\n", "");
+                    }
+                }
+            }
+
+            if(vCard.toUpperCase().contains("SIP")) {
+                for (int i=0; i < attr.length; i++) {
+                    if(attr[i].toUpperCase().contains("SIP")){
+                        vCard = vCard.replace(attr[i] + "\n", "");
+                    }
+                }
+            }
+
+            Log.v(TAG, "Tokens after applying filter: ");
+
+            for (int i=0; i < attr.length; i++) {
+                if(!attr[i].equals("")){
+                    filteredVcard = filteredVcard.concat(attr[i] + "\n");
+                }
+            }
+
+            return filteredVcard;
         }
     }
 }

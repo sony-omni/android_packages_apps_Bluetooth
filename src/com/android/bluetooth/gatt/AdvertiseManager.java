@@ -89,6 +89,16 @@ class AdvertiseManager {
     void cleanup() {
         logd("advertise clients cleared");
         mAdvertiseClients.clear();
+
+        if (mHandler != null) {
+            // Shut down the thread
+            mHandler.removeCallbacksAndMessages(null);
+            Looper looper = mHandler.getLooper();
+            if (looper != null) {
+                looper.quit();
+            }
+            mHandler = null;
+        }
     }
 
     /**
@@ -220,17 +230,17 @@ class AdvertiseManager {
         }
 
         // Returns maximum advertise instances supported by controller.
-        int maxAdvertiseInstances() {
-            // Note numOfAdvtInstances includes the standard advertising instance.
-            // TODO: remove - 1 once the stack is able to include standard instance for multiple
-            // advertising.
-            if (mAdapterService.isMultiAdvertisementSupported()) {
-                return mAdapterService.getNumOfAdvertisementInstancesSupported() - 1;
+        private int maxAdvertiseInstances() {
+            AdapterService adapter;
+            int numOfAdvtInstances = 0;
+            if (null != (adapter = AdapterService.getAdapterService())){
+                numOfAdvtInstances = adapter.getNumOfAdvertisementInstancesSupported();
+                // Note numOfAdvtInstances includes the standard advertising instance.
+                // TODO: remove - 1 once the stack is able to include standard instance for multiple
+                // advertising.
+                return numOfAdvtInstances - 1;
             }
-            if (mAdapterService.isPeripheralModeSupported()) {
-                return 1;
-            }
-            return 0;
+            return numOfAdvtInstances;
         }
     }
 

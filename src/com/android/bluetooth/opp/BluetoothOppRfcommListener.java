@@ -50,7 +50,7 @@ import android.util.Log;
 public class BluetoothOppRfcommListener {
     private static final String TAG = "BtOppRfcommListener";
 
-    private static final boolean V = Constants.VERBOSE;
+    private static final boolean V = Log.isLoggable(Constants.TAG, Log.VERBOSE) ? true : false;
 
     public static final int MSG_INCOMING_BTOPP_CONNECTION = 100;
 
@@ -158,8 +158,8 @@ public class BluetoothOppRfcommListener {
                                     clientSocket = sSocket.accept();
                                     if (V) Log.v(TAG, "Accepted connection from "
                                         + clientSocket.getRemoteDevice());
-                                    BluetoothOppRfcommTransport transport = new BluetoothOppRfcommTransport(
-                                        clientSocket);
+                                BluetoothOppTransport transport = new BluetoothOppTransport(
+                                        clientSocket, BluetoothOppTransport.TYPE_RFCOMM);
                                     Message msg = Message.obtain();
                                     msg.setTarget(mCallback);
                                     msg.what = MSG_INCOMING_BTOPP_CONNECTION;
